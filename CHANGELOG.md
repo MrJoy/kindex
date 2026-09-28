@@ -4,6 +4,8 @@ All notable changes to Kindex are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-09-28
+
 ### Added
 - Two Kinbase query tools sit beside `kinbase_sync`: `kinbase_status` reports a
   repository's certification, trusted fact count and open Unknowns, and
@@ -17,6 +19,10 @@ All notable changes to Kindex are documented here. Format follows [Keep a Change
   Generating a whole task brief stays `kinbase project`, outside the tool
   surface: it records the query and may open an Unknown, which an agent calling
   it in a loop would turn into noise in the queue people read.
+
+### Fixed
+- Desktop health alerts identify the agent session they came from, so an alert
+  names which session is unhealthy rather than leaving it to be guessed (#66).
 
 ## [0.44.1] - 2026-09-23
 
