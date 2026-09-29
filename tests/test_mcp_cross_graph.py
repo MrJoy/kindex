@@ -303,6 +303,121 @@ def test_global_watch_resolves_in_its_source_graph(graphs):
     assert local.get_node(watch_id) is None
 
 
+def test_watch_add_links_qualified_global_result_only_in_global_graph(graphs):
+    server, local, home, _ = graphs
+    source_id = home.add_node("Global watch context")
+    source_ref = server._graph_ref("global", source_id)
+
+    result = server.watch_add("Monitor global context", owner="platform",
+                              link_to=source_ref)
+
+    assert "Watch created" in result
+    watch_ref = result.split("id=", 1)[1].split(",", 1)[0].split(")", 1)[0]
+    assert watch_ref.startswith("global:")
+    watch_id = watch_ref.rsplit(":", 1)[1]
+    assert home.get_node(watch_id)["extra"]["owner"] == "platform"
+    assert local.get_node(watch_id) is None
+    assert any(edge["to_id"] == source_id for edge in home.edges_from(watch_id))
+    assert not local.edges_from(watch_id)
+
+
+@pytest.mark.parametrize("bad_ref, expected", [
+    ("missing", "unavailable"),
+    ("stale", "Stale graph reference"),
+    ("cross_store", "cross-graph links"),
+    ("ambiguous", "title_collision"),
+])
+def test_watch_add_rejects_bad_links_before_creating_node(graphs, bad_ref, expected):
+    server, local, home, _ = graphs
+    global_id = home.add_node("Global watch source")
+    local_id = local.add_node("Local watch source")
+    if bad_ref == "missing":
+        link_to = f"{server._graph_ref('global', global_id)},missing target"
+    elif bad_ref == "stale":
+        link_to = f"{server._graph_ref('global', global_id)},global:oldscope:{global_id}"
+    elif bad_ref == "cross_store":
+        link_to = (f"{server._graph_ref('global', global_id)},"
+                   f"{server._graph_ref('project', local_id)}")
+    else:
+        home.add_node("Duplicate target")
+        home.add_node("Duplicate target")
+        link_to = f"{server._graph_ref('global', global_id)},Duplicate target"
+
+    result = server.watch_add("Rejected watch", link_to=link_to)
+
+    assert expected in result
+    assert local.get_node_by_title("Rejected watch") is None
+    assert home.get_node_by_title("Rejected watch") is None
+
+
+def test_watch_add_rejects_bare_cross_graph_collision(graphs):
+    server, local, home, _ = graphs
+    local.add_node("Shared target")
+    home.add_node("Shared target")
+
+    assert "exists in both graphs" in server.watch_add(
+        "Ambiguous watch", link_to="Shared target")
+    assert local.get_node_by_title("Ambiguous watch") is None
+    assert home.get_node_by_title("Ambiguous watch") is None
+
+
+def test_watch_add_preserves_local_and_source_free_selection(graphs):
+    server, local, home, _ = graphs
+    local_id = local.add_node("Local watch source")
+
+    linked = server.watch_add("Local linked watch", link_to=local_id)
+    server.watch_add("Local source-free watch")
+
+    linked_id = linked.split("id=", 1)[1].split(")", 1)[0]
+    assert local.get_node(linked_id)["type"] == "watch"
+    assert any(edge["to_id"] == local_id for edge in local.edges_from(linked_id))
+    assert local.get_node_by_title("Local source-free watch") is not None
+    assert home.get_node_by_title("Local linked watch") is None
+    assert home.get_node_by_title("Local source-free watch") is None
+
+
+def test_watch_add_project_qualified_link_does_not_open_outdated_secondary(graphs):
+    server, local, home, _ = graphs
+    local_id = local.add_node("Project-qualified watch source")
+    home.conn.execute("UPDATE meta SET value='3' WHERE key='schema_version'")
+    home.conn.commit()
+
+    result = server.watch_add(
+        "Project watch despite outdated secondary",
+        link_to=server._graph_ref("project", local_id))
+
+    assert "Watch created" in result
+    watch = local.get_node_by_title("Project watch despite outdated secondary")
+    assert watch is not None
+    assert any(edge["to_id"] == local_id for edge in local.edges_from(watch["id"]))
+    assert home.get_meta("schema_version") == "3"
+
+
+def test_watch_add_global_source_ref_routes_without_link(graphs):
+    server, local, home, _ = graphs
+    source_id = home.add_node("Global source for watch")
+
+    result = server.watch_add("Derived global watch",
+                              source_refs=server._graph_ref("global", source_id))
+
+    assert "id=global:" in result
+    assert home.get_node_by_title("Derived global watch") is not None
+    assert local.get_node_by_title("Derived global watch") is None
+
+
+def test_watch_add_explicit_profile_cannot_cross_to_global(graphs):
+    server, local, home, _ = graphs
+    global_id = home.add_node("Global target")
+    local.config.active_profile = "work"
+
+    result = server.watch_add("Profile-isolated watch",
+                              link_to=server._graph_ref("global", global_id))
+
+    assert "global graph is unavailable" in result.lower()
+    assert local.get_node_by_title("Profile-isolated watch") is None
+    assert home.get_node_by_title("Profile-isolated watch") is None
+
+
 def test_explicit_profile_keeps_search_isolated(graphs):
     server, local, home, _ = graphs
     local.config.active_profile = "work"

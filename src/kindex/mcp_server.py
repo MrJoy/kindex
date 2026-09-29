@@ -3169,7 +3169,8 @@ def lock_release(node_id: str, force: bool = False) -> str:
 
 @_tool()
 def watch_add(text: str, owner: str = "", expires: str = "",
-              link_to: str = "") -> str:
+              link_to: str = "", graph: str = "",
+              source_refs: str = "") -> str:
     """Create a watch node for something needing periodic attention.
 
     Watches surface in every session's context. Use for:
@@ -3182,8 +3183,53 @@ def watch_add(text: str, owner: str = "", expires: str = "",
         owner: Who owns this watch (person or team).
         expires: When this watch expires (YYYY-MM-DD). Auto-archived after expiry.
         link_to: Comma-separated node IDs/titles to link this watch to.
+        graph: project (selected graph) or global (configured outer graph).
+        source_refs: Comma-separated graph-qualified evidence IDs. A global
+            source routes this watch to the global graph.
     """
-    store, _ = _get_store()
+    from .store import AmbiguousTitleError
+
+    refs = [ref.strip() for ref in link_to.split(",") if ref.strip()]
+    try:
+        store, _, graph = _derived_write_store(
+            graph, ",".join(part for part in (source_refs, link_to) if part))
+
+        # Resolve every target before creating the watch. A bare name or ID
+        # present in both graphs cannot identify which graph the caller meant.
+        primary, primary_config = _get_store()
+        other = None
+        checked_other = False
+        try:
+            targets = []
+            for ref in refs:
+                qualified = _split_graph_ref(ref)
+                if qualified and qualified[0] != graph:
+                    raise ValueError("cross-graph links are not supported")
+                raw_ref = qualified[1] if qualified else ref
+                target = store.resolve_node_for_write(raw_ref)
+                if target is None:
+                    raise ValueError(f"Link target {ref} is unavailable")
+                if not qualified:
+                    if not checked_other:
+                        other = (primary if graph == "global" else
+                                 _global_read_store(primary, primary_config))
+                        checked_other = True
+                    if other is not None:
+                        try:
+                            other_match = other.resolve_node_for_write(ref)
+                        except AmbiguousTitleError:
+                            other_match = True
+                        if other_match:
+                            raise ValueError(
+                                f"Node {ref} exists in both graphs; use a qualified search result ID")
+                targets.append(target["id"])
+        finally:
+            if other is not None and other is not primary:
+                other.close()
+    except AmbiguousTitleError as exc:
+        return f"Error: title_collision: {exc}"
+    except ValueError as exc:
+        return f"Error: {exc}"
 
     extra = {"watch_status": "active"}
     if owner:
@@ -3205,20 +3251,14 @@ def watch_add(text: str, owner: str = "", expires: str = "",
         extra=extra,
     )
 
-    # Link to specified nodes
-    if link_to:
-        for ref in link_to.split(","):
-            ref = ref.strip()
-            if not ref:
-                continue
-            target = store.get_node(ref) or store.get_node_by_title(ref)
-            if target:
-                store.add_edge(nid, target["id"], edge_type="relates_to",
-                               weight=0.5, provenance="watch context")
+    for target_id in targets:
+        store.add_edge(nid, target_id, edge_type="relates_to",
+                       weight=0.5, provenance="watch context")
 
     exp = f", expires {expires}" if expires else ""
     own = f", owner: {owner}" if owner else ""
-    return f"Watch created: {text} (id={nid}{exp}{own})"
+    display_id = _graph_ref("global", nid) if graph == "global" else nid
+    return f"Watch created: {text} (id={display_id}{exp}{own})"
 
 
 @_tool()
