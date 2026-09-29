@@ -220,12 +220,29 @@ def ambiguous_mcp(tmp_path, monkeypatch):
 
 
 def test_unconfigured_mcp_status_uses_the_present_project_graph(ambiguous_mcp):
-    result = ambiguous_mcp["mcp"].status()
-    assert not result.startswith("Error: memory unavailable"), result
-    assert "Nodes:" in result
-    nodes = ambiguous_mcp["mcp"].list_nodes()
-    assert "Synthetic project-node" in nodes
-    assert "Synthetic home-node" not in nodes
+    mcp = ambiguous_mcp["mcp"]
+    store, config = mcp._get_store()
+    assert config.data_path == (ambiguous_mcp["project"] / ".kin" / "local" / "kindex")
+    assert store.get_node("project-node") is not None
+    assert store.get_node("home-node") is None
+
+    auto_status = mcp.status()
+    assert "## Project graph" in auto_status
+    assert "## Global graph" in auto_status
+    assert auto_status.count("Nodes: 1 semantic") == 2
+    auto_nodes = mcp.list_nodes()
+    assert "Synthetic project-node" in auto_nodes
+    assert "Synthetic home-node" in auto_nodes
+
+    project_nodes = mcp.list_nodes(graph="project")
+    assert "Synthetic project-node" in project_nodes
+    assert "Synthetic home-node" not in project_nodes
+    assert mcp.status(graph="project").startswith("# Kindex Status")
+
+    global_nodes = mcp.list_nodes(graph="global")
+    assert "Synthetic home-node" in global_nodes
+    assert "Synthetic project-node" not in global_nodes
+    assert "## Global graph" in mcp.status(graph="global")
 
 
 def test_task_execute_needs_no_legacy_store(ambiguous_mcp, monkeypatch):
