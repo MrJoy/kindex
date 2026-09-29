@@ -71,6 +71,18 @@ class TestMCPAdd:
         assert "Created node" in result
         assert "question" in result
 
+    def test_single_store_creation_keeps_raw_ids(self, patch_store):
+        from kindex.mcp_server import add, task_add, watch_add
+
+        store, _ = patch_store
+        node = add("Single-store node")
+        task = task_add("Single-store task")
+        watch = watch_add("Single-store watch")
+
+        assert f"Created node: {store.get_node_by_title('Single-store node')['id']} " in node
+        assert f"Created task: {store.get_node_by_title('Single-store task')['id']} " in task
+        assert f"id={store.get_node_by_title('Single-store watch')['id']})" in watch
+
 
 class TestMCPContext:
     def test_context_with_topic(self, patch_store):

@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import sys
+from pathlib import Path
 from typing import Any
 from .privacy import redact, redact_serialized, safe_error, redacting_print as print
 
@@ -364,6 +365,39 @@ def _graph_ref(graph: str, node_id: str) -> str:
     return f"{graph}:{store._mcp_graph_scope}:{node_id}"
 
 
+def _graph_aware_session() -> bool:
+    """Whether the selected project can address a configured outer graph.
+
+    Formatting must not open the secondary database just to choose an ID.
+    """
+    from .project_store import is_project_store
+
+    store, config = _get_store()
+    project = str(config._project_path) if config._project_path else ""
+    return (bool(project and getattr(config, "_global_data_dir", None))
+            and not config.active_profile and is_project_store(store, project)
+            and config.data_path.resolve() !=
+            Path(config._global_data_dir).expanduser().resolve())
+
+
+def _display_ref(graph: str, node_id: str, *, incoming_ref: str = "") -> str:
+    """Preserve graph identity for a routed ref or a dual-graph session."""
+    if (graph == "global" or incoming_ref.startswith(("project:", "global:"))
+            or _graph_aware_session()):
+        return _graph_ref(graph, node_id)
+    return node_id
+
+
+def _display_task_record(record: dict | None, graph: str,
+                         *, incoming_ref: str = "") -> dict | None:
+    if record is not None:
+        record["id"] = _display_ref(graph, record["id"], incoming_ref=incoming_ref)
+        record["dependencies"] = [
+            _display_ref(graph, dependency, incoming_ref=incoming_ref)
+            for dependency in record["dependencies"]]
+    return record
+
+
 def _split_graph_ref(ref: str) -> tuple[str, str] | None:
     """Reject references issued by a different MCP store selection."""
     if not ref.startswith(("project:", "global:")):
@@ -579,16 +613,19 @@ def _node_summary(node: dict) -> str:
     ntype = node.get("type", "concept")
     title = node.get("title", node.get("id", "?"))
     weight = node.get("weight", 0)
-    return f"[{ntype}] {title} (w={weight:.2f}, id={node['id']})"
+    display_id = _display_ref("project", node["id"])
+    return f"[{ntype}] {title} (w={weight:.2f}, id={display_id})"
 
 
-def _node_detail(store, node: dict) -> str:
+def _node_detail(store, node: dict, *, graph: str = "project",
+                 incoming_ref: str = "") -> str:
     """Multi-line detail view of a node with edges."""
+    display_id = _display_ref(graph, node["id"], incoming_ref=incoming_ref)
     lines = [
         f"# {node.get('title', node['id'])}",
         f"Type: {node.get('type', 'concept')}  |  Weight: {node.get('weight', 0):.2f}  |  "
         f"Audience: {node.get('audience', 'private')}",
-        f"ID: {node['id']}",
+        f"ID: {display_id}",
     ]
     if node.get("domains"):
         lines.append(f"Tags: {', '.join(node.get('tags') or node.get('domains') or [])}")
@@ -601,7 +638,9 @@ def _node_detail(store, node: dict) -> str:
     if edges:
         lines.append(f"\n## Connections ({len(edges)})")
         for e in edges[:20]:
-            lines.append(f"  -> {e.get('to_title', e['to_id'])} ({e['type']}, w={e['weight']:.2f})")
+            target_id = _display_ref(graph, e["to_id"], incoming_ref=incoming_ref)
+            lines.append(f"  -> {e.get('to_title', e['to_id'])} "
+                         f"(id={target_id}, {e['type']}, w={e['weight']:.2f})")
 
     prov_parts = []
     if node.get("prov_who"):
@@ -932,7 +971,7 @@ def add(
                            provenance="auto-linked via MCP")
             link_count += 1
 
-    display_id = _graph_ref("global", nid) if graph == "global" else nid
+    display_id = _display_ref(graph, nid)
     return f"Created node: {display_id} ({node_type})" + (
         f" with {link_count} auto-link(s)" if link_count else ""
     )
@@ -1001,7 +1040,7 @@ def edit(node_id: str, title: str = "", content: str = "", append: str = "",
     except (EditPolicyError, LockHeldError, ValueError) as e:
         return f"Error: {e}"
 
-    updated_ref = _graph_ref("global", updated["id"]) if graph == "global" else updated["id"]
+    updated_ref = _display_ref(graph, updated["id"], incoming_ref=node_id)
     return (f"Edited {updated.get('title', '')} ({updated_ref}) — "
             f"fields: {', '.join(sorted(provided))}")
 
@@ -1045,8 +1084,9 @@ def supersede(node_id: str, new_text: str, expires: str = "", reason: str = "") 
     except (LockHeldError, ValueError) as e:
         return f"Error: {e}"
 
-    new_ref = _graph_ref("global", new["id"]) if graph == "global" else new["id"]
-    return f"Superseded {node['title']} ({node_id}) -> new node {new_ref}"
+    old_ref = _display_ref(graph, node["id"], incoming_ref=node_id)
+    new_ref = _display_ref(graph, new["id"], incoming_ref=node_id)
+    return f"Superseded {node['title']} ({old_ref}) -> new node {new_ref}"
 
 
 @_tool()
@@ -1324,7 +1364,10 @@ def verify(
             valid_at=valid_at or None,
             invalid_at=invalid_at or None,
         )
-        return {**result, "id": node_id, "graph": "global"} if graph == "global" else result
+        result = {**result, "id": _display_ref(graph, node["id"], incoming_ref=node_id)}
+        if graph == "global":
+            result["graph"] = graph
+        return result
     except ValueError as exc:
         return _state_error(exc)
 
@@ -1375,7 +1418,10 @@ def invalidate(
             disposition_code=disposition_code,
             invalid_at=invalid_at or operation_instant,
         )
-        return {**result, "id": node_id, "graph": "global"} if graph == "global" else result
+        result = {**result, "id": _display_ref(graph, node["id"], incoming_ref=node_id)}
+        if graph == "global":
+            result["graph"] = graph
+        return result
     except ValueError as exc:
         return _state_error(exc)
 
@@ -1393,13 +1439,16 @@ def show(node_id: str) -> str:
         return f"Error: {exc}"
     try:
         node = store.get_node(raw_id) or store.get_node_by_title(raw_id)
-        detail = _node_detail(store, node) if node else None
+        detail = _node_detail(store, node, graph=graph,
+                              incoming_ref=node_id) if node else None
     finally:
         if graph == "global":
             store.close()
     if not node:
         return f"Node not found: {node_id}"
-    return f"[graph: global, id: {node_id}]\n{detail}" if graph == "global" else detail
+    display_id = _display_ref(graph, node["id"], incoming_ref=node_id)
+    return (f"[graph: {graph}, id: {display_id}]\n{detail}"
+            if display_id != node["id"] else detail)
 
 
 @_tool()
@@ -1937,7 +1986,7 @@ def stale_check(base_dir: str = "", rebind: str = "") -> str:
         except Exception as e:
             return f"Error: {e}"
         ref = node.get("referent") or {}
-        display_id = _graph_ref("global", node["id"]) if graph == "global" else node["id"]
+        display_id = _display_ref(graph, node["id"], incoming_ref=rebind)
         return (f"Rebound {display_id} to "
                 f"{(ref.get('content_digest') or '')[:12]} "
                 f"(true_of {node.get('true_of')}); stale marker cleared.")
@@ -2258,13 +2307,16 @@ def resource_node(node_id: str) -> str:
         return f"Error: {exc}"
     try:
         node = store.get_node(raw_id) or store.get_node_by_title(raw_id)
-        detail = _node_detail(store, node) if node else None
+        detail = _node_detail(store, node, graph=graph,
+                              incoming_ref=node_id) if node else None
     finally:
         if graph == "global":
             store.close()
     if not node:
         return f"Node not found: {node_id}"
-    return f"[graph: global, id: {node_id}]\n{detail}" if graph == "global" else detail
+    display_id = _display_ref(graph, node["id"], incoming_ref=node_id)
+    return (f"[graph: {graph}, id: {display_id}]\n{detail}"
+            if display_id != node["id"] else detail)
 
 
 @mcp.resource("kindex://recent")
@@ -2602,7 +2654,7 @@ def task_add(text: str, priority: int = 3, due: str = "",
     p_label = {1: "urgent", 2: "high", 3: "normal", 4: "low", 5: "someday"}.get(
         extra.get("priority", 3), "normal")
     due_info = f", due: {extra.get('due', '')}" if extra.get("due") else ""
-    display_id = _graph_ref("global", task_id) if graph == "global" else task_id
+    display_id = _display_ref(graph, task_id)
     return f"Created task: {display_id} [{p_label}]{due_info} — {text}"
 
 
@@ -2687,7 +2739,8 @@ def task_done(id: str, agent: str = "", force: bool = False) -> str:
     except TaskClaimedError as exc:
         return f"Error: {exc.code}: {exc}"
     if result:
-        return f"Completed: {result['title']} ({id})"
+        return (f"Completed: {result['title']} "
+                f"({_display_ref(graph, result['id'], incoming_ref=id)})")
     return f"Task not found: {id}"
 
 
@@ -2721,7 +2774,8 @@ def task_claim(id: str, agent: str = "", ttl_minutes: int = 120,
         return f"Task not found: {id}"
     claim = (result.get("extra") or {}).get("claim") or {}
     return (
-        f"Claimed task: {result['title']} ({id}) by {claim.get('agent')} "
+        f"Claimed task: {result['title']} "
+        f"({_display_ref(graph, result['id'], incoming_ref=id)}) by {claim.get('agent')} "
         f"until {claim.get('expires_at')}"
     )
 
@@ -2746,7 +2800,8 @@ def task_release(id: str, agent: str = "", force: bool = False) -> str:
         return f"Could not release task claim: {e}"
     if not result:
         return f"Task not found: {id}"
-    return f"Released task claim: {result['title']} ({id})"
+    return (f"Released task claim: {result['title']} "
+            f"({_display_ref(graph, result['id'], incoming_ref=id)})")
 
 
 @_tool()
@@ -2764,10 +2819,7 @@ def task_get(id: str) -> dict:
         if graph == "global":
             store.close()
     record = task_record(node) if node else None
-    if record and graph == "global":
-        record["id"] = _graph_ref("global", record["id"])
-        record["dependencies"] = [
-            _graph_ref("global", dependency) for dependency in record["dependencies"]]
+    record = _display_task_record(record, graph, incoming_ref=id)
     return {"ok": True, "task": record} if node else {
         "ok": False, "error": {"code": "not_found", "message": "Task not found"}}
 
@@ -2814,10 +2866,7 @@ def task_update(id: str, title: str | None = None, content: str | None = None,
         return {"ok": False, "error": {"code": getattr(exc, "code", "invalid_argument"),
                                        "message": safe_error(exc)}}
     record = task_record(node) if node else None
-    if record and graph == "global":
-        record["id"] = _graph_ref("global", record["id"])
-        record["dependencies"] = [
-            _graph_ref("global", dependency) for dependency in record["dependencies"]]
+    record = _display_task_record(record, graph, incoming_ref=id)
     return {"ok": True, "task": record} if node else {
         "ok": False, "error": {"code": "not_found", "message": "Task not found"}}
 
@@ -3132,7 +3181,8 @@ def lock_acquire(node_id: str, ttl_minutes: int = 60, note: str = "",
                          ttl_minutes=ttl_minutes, note=note, force=force)
     except (LockHeldError, ValueError) as e:
         return f"Could not lock node: {e}"
-    return (f"Locked {node['title']} ({node['id']}) for {lock['agent']} "
+    display_id = _display_ref(graph, node["id"], incoming_ref=node_id)
+    return (f"Locked {node['title']} ({display_id}) for {lock['agent']} "
             f"until {lock['expires_at']}")
 
 
@@ -3159,9 +3209,10 @@ def lock_release(node_id: str, force: bool = False) -> str:
         cleared = unlock_node(store, node["id"], _default_agent(), force=force)
     except LockHeldError as e:
         return f"Could not unlock node: {e}"
+    display_id = _display_ref(graph, node["id"], incoming_ref=node_id)
     if cleared:
-        return f"Unlocked {node['title']} ({node['id']})"
-    return f"No lock on {node['title']} ({node['id']})"
+        return f"Unlocked {node['title']} ({display_id})"
+    return f"No lock on {node['title']} ({display_id})"
 
 
 # ── Watches ──────────────────────────────────────────────────────────
@@ -3257,7 +3308,7 @@ def watch_add(text: str, owner: str = "", expires: str = "",
 
     exp = f", expires {expires}" if expires else ""
     own = f", owner: {owner}" if owner else ""
-    display_id = _graph_ref("global", nid) if graph == "global" else nid
+    display_id = _display_ref(graph, nid)
     return f"Watch created: {text} (id={display_id}{exp}{own})"
 
 
@@ -3282,7 +3333,7 @@ def watch_list(status: str = "active") -> str:
     lines = [f"Watches ({len(watches)}):"]
     for w in watches:
         extra = w.get("extra") or {}
-        parts = [f"- {w['title']} (id={w['id']})"]
+        parts = [f"- {w['title']} (id={_display_ref('project', w['id'])})"]
         if extra.get("owner"):
             parts.append(f"@{extra['owner']}")
         if extra.get("expires"):
@@ -3315,7 +3366,8 @@ def watch_resolve(id: str, reason: str = "") -> str:
     # passing extra — a concurrent extra writer is never clobbered.
     store.atomic_extra_update(raw_id, _mutate)
     store.update_node(raw_id, status="archived", weight=0.01)
-    return f"Resolved watch: {node['title']} ({id})"
+    return (f"Resolved watch: {node['title']} "
+            f"({_display_ref(graph, node['id'], incoming_ref=id)})")
 
 
 # ── Reminders ─────────────────────────────────────────────────────────

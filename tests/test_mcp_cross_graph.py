@@ -244,6 +244,8 @@ def test_stale_qualified_reference_cannot_mutate_new_graph_selection(graphs, tmp
     try:
         assert "Stale graph reference" in server.edit(old_ref, append="wrong")
         assert "Stale graph reference" in server.edit(old_project_ref, append="wrong")
+        assert "Stale graph reference" in server.lock_acquire(old_ref)
+        assert "Stale graph reference" in server.show(old_project_ref)
         assert "Stale graph reference" in server.add("Wrong derivation", source_refs=old_ref)
         assert next_global.get_node(shared)["content"] == ""
         assert next_local.get_node(shared)["content"] == ""
@@ -301,6 +303,118 @@ def test_global_watch_resolves_in_its_source_graph(graphs):
     assert "Resolved watch" in server.watch_resolve(server._graph_ref("global", watch_id))
     assert home.get_node(watch_id)["status"] == "archived"
     assert local.get_node(watch_id) is None
+
+
+def test_global_lock_response_round_trips_to_unlock(graphs):
+    server, local, home, _ = graphs
+    node_id = home.add_node("Global lock target")
+    source_ref = server._graph_ref("global", node_id)
+
+    acquired = server.lock_acquire(source_ref)
+    returned_ref = acquired.split("(", 1)[1].split(")", 1)[0]
+
+    assert returned_ref == source_ref
+    assert f"Unlocked Global lock target ({source_ref})" == server.lock_release(returned_ref)
+    assert local.get_node(node_id) is None
+
+
+def test_project_task_response_dependencies_round_trip_with_id_collision(graphs):
+    server, local, home, _ = graphs
+    dependency = create_task(local, "Project dependency")
+    task_id = create_task(local, "Project dependent", dependencies=[dependency])
+    home.add_node("Global collision", node_id=dependency)
+    home.add_node("Another global collision", node_id=task_id)
+    task_ref = server._graph_ref("project", task_id)
+    dependency_ref = server._graph_ref("project", dependency)
+
+    fetched = server.task_get(task_ref)
+    assert fetched["task"]["id"] == task_ref
+    assert fetched["task"]["dependencies"] == [dependency_ref]
+    updated = server.task_update(fetched["task"]["id"], priority=2,
+                                 dependencies=fetched["task"]["dependencies"])
+    assert updated["ok"]
+    assert updated["task"]["id"] == task_ref
+    assert updated["task"]["dependencies"] == [dependency_ref]
+    assert server.task_get(dependency_ref)["task"]["title"] == "Project dependency"
+
+
+def test_node_detail_and_resource_preserve_global_connection_refs(graphs):
+    server, local, home, _ = graphs
+    node_id = home.add_node("Global detail", content="User content has raw id 123")
+    neighbor_id = home.add_node("Global neighbor")
+    home.add_edge(node_id, neighbor_id)
+    local.add_node("Local collision", node_id=neighbor_id)
+    source_ref = server._graph_ref("global", node_id)
+    neighbor_ref = server._graph_ref("global", neighbor_id)
+
+    for detail in (server.show(source_ref), server.resource_node(source_ref)):
+        assert f"ID: {source_ref}" in detail
+        assert f"id={neighbor_ref}" in detail
+        assert "User content has raw id 123" in detail
+
+
+def test_new_project_responses_are_qualified_for_followup_mutations(graphs):
+    server, local, home, _ = graphs
+    created = server.add("New project concept")
+    node_ref = created.split("Created node: ", 1)[1].split(" ", 1)[0]
+    assert node_ref.startswith("project:")
+    assert "Edited New project concept" in server.edit(node_ref, append="verified")
+
+    task = server.task_add("New project task")
+    task_ref = task.split("Created task: ", 1)[1].split(" ", 1)[0]
+    assert task_ref.startswith("project:")
+    assert server.task_get(task_ref)["task"]["id"] == task_ref
+
+    watch = server.watch_add("New project watch")
+    watch_ref = watch.split("id=", 1)[1].split(")", 1)[0]
+    assert watch_ref.startswith("project:")
+    assert watch_ref in server.watch_resolve(watch_ref)
+    assert home.get_node_by_title("New project concept") is None
+    assert local.get_node_by_title("New project concept") is not None
+
+
+def test_project_response_formatting_does_not_open_secondary(graphs, monkeypatch):
+    server, local, _, _ = graphs
+    node_id = local.add_node("Project detail")
+    neighbor_id = local.add_node("Project neighbor")
+    local.add_edge(node_id, neighbor_id)
+    task_id = create_task(local, "Project task detail", dependencies=[])
+    source_ref = server._graph_ref("project", node_id)
+    neighbor_ref = server._graph_ref("project", neighbor_id)
+    task_ref = server._graph_ref("project", task_id)
+
+    def forbidden_secondary(*args, **kwargs):
+        raise AssertionError("response formatting opened secondary graph")
+
+    monkeypatch.setattr(server, "_global_read_store", forbidden_secondary)
+    for detail in (server.show(source_ref), server.resource_node(source_ref)):
+        assert f"ID: {source_ref}" in detail
+        assert f"id={neighbor_ref}" in detail
+    assert server.task_get(task_ref)["task"]["id"] == task_ref
+    assert source_ref in server.lock_acquire(source_ref)
+    assert source_ref in server.lock_release(source_ref)
+
+
+def test_project_list_responses_expose_qualified_ids(graphs):
+    server, local, _, _ = graphs
+    node_id = local.add_node("Listed project node")
+    watch_id = local.add_node("Listed project watch", node_type="watch",
+                              extra={"watch_status": "active"})
+
+    assert server._graph_ref("project", node_id) in server.list_nodes()
+    assert server._graph_ref("project", watch_id) in server.watch_list()
+
+
+def test_explicit_profile_preserves_incoming_project_qualification(graphs):
+    server, local, _, _ = graphs
+    node_id = local.add_node("Profiled project node")
+    local.config.active_profile = "work"
+    source_ref = server._graph_ref("project", node_id)
+
+    assert f"ID: {source_ref}" in server.show(source_ref)
+    assert source_ref in server.lock_acquire(source_ref)
+    assert source_ref in server.lock_release(source_ref)
+    assert "Created node: project:" not in server.add("Profile source-free node")
 
 
 def test_watch_add_links_qualified_global_result_only_in_global_graph(graphs):
@@ -369,8 +483,10 @@ def test_watch_add_preserves_local_and_source_free_selection(graphs):
     server.watch_add("Local source-free watch")
 
     linked_id = linked.split("id=", 1)[1].split(")", 1)[0]
-    assert local.get_node(linked_id)["type"] == "watch"
-    assert any(edge["to_id"] == local_id for edge in local.edges_from(linked_id))
+    assert linked_id.startswith("project:")
+    raw_id = linked_id.rsplit(":", 1)[1]
+    assert local.get_node(raw_id)["type"] == "watch"
+    assert any(edge["to_id"] == local_id for edge in local.edges_from(raw_id))
     assert local.get_node_by_title("Local source-free watch") is not None
     assert home.get_node_by_title("Local linked watch") is None
     assert home.get_node_by_title("Local source-free watch") is None
