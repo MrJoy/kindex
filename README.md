@@ -301,6 +301,15 @@ treat tracked `.kin` files as shipped project state, not local cache.
 If the host also exposes session-local task tools, use those only for temporary
 planning; durable work belongs in Kindex.
 
+For MCP clients in a repository, retain either project- or global-qualified
+references when reads supply them, and pass them unchanged to follow-up tools.
+In dual-graph sessions, use those qualified evidence IDs in `source_refs` when
+a new node or task derives from existing knowledge. Ordinary single-store and
+profile responses keep legacy raw IDs; `source_refs` does not accept those raw
+IDs. Search again after restarting the MCP server because qualified reference
+tokens are bound to its store selection. See [Profiles](#profiles) for read
+scopes and write routing.
+
 The Claude SessionStart hook (`kin setup-hooks`) and Codex hooks (`kin setup-codex-hooks`) reinforce these directives at the start of supported sessions with a "Session directives" block that reminds the agent to use kindex MCP tools throughout the session.
 
 ### What gets captured
@@ -702,7 +711,47 @@ Register the existing legacy graph (usually `~/.kindex`) as the default profile 
 
 **MCP note.** The MCP server binds its profile once at process start and keeps it for the process lifetime. To switch profiles for an agent, restart its MCP server (or run a second server with `KIN_PROFILE` set in its environment).
 
-When MCP implicitly selects a repository-local graph, `search` also reads the globally configured data directory and merges both result sets. `task_list` includes global tasks and tasks assigned to the current project from that graph. Results carry `project:<session>:<id>` or `global:<session>:<id>` references; `show`, node edits, links, and task mutations route them back to their source graph. The session token binds a reference to one MCP store selection. After an MCP restart or graph change, search again to obtain a fresh reference; stale references are rejected. Cross-graph links are rejected. New `add`, `learn`, and `task_add` calls can set `graph="global"` or pass qualified results in `source_refs`; mixed evidence routes new work to the configured global graph. Explicit profile selection remains isolated. Repository and branch names are context for relevance, not authority to write to another worktree's graph.
+Without an active profile or explicit store selection, a present repository-local
+`.kin/local` store becomes the selected graph. Auto reads include that selected
+graph and the configured user graph. `search`, `task_list`,
+`context`, `ask`, `prime`, `list_nodes`, `status`, `suggest`, `graph_stats`,
+`graph_heal`, `changelog`, `watch_list`, and `orient` accept
+`graph="auto"|"project"|"global"`. Auto consults both allowed stores; project
+reads only the selected store, including when the user graph is unavailable;
+global reads only the configured user store. The fixed `kindex://status`,
+`kindex://recent`, and `kindex://orphans` resources use auto scope. An explicit
+profile remains a single-store boundary and refuses global scope.
+
+Dual-graph results carry `project:<session>:<id>` or
+`global:<session>:<id>` references. Ordinary single-store/profile reads retain
+raw IDs for legacy compatibility.
+Keep the full reference for `show`, edits, links, task mutations, and watch
+resolution. The session token binds it to one MCP store selection; stale
+references fail after a restart or graph change. Each graph's hybrid search
+keeps its own ranking, and results from both are interleaved by reciprocal
+rank. A merged rank is not a calibrated relevance score across databases.
+Diagnostics show separate graph sections because edges and components do not
+cross stores.
+
+Source-free `add`, `learn`, `task_add`, and `watch_add` write to the selected
+store (the project graph when presence selects it). Set `graph="global"` for
+an explicit outer write in a dual-graph session, or pass current
+graph-qualified evidence IDs in `source_refs` to route a derived
+write: any global source routes mixed project/global evidence to the user
+graph. `source_refs` never accepts bare IDs. `link_to` may accept a bare title
+or ID only when it resolves unambiguously; mixed-store links are refused
+before creation, and Kindex never creates cross-store edges. A contextual
+`task_add` routed to the user graph inherits the bound selected project path
+when `project_path` is omitted, so default `task_list` can find it. An explicit
+project path wins; `scope="global"` remains globally visible without inferred
+project association. Coordination, modes, session tags, and other selected-only
+operational tools do not gain a global mutation mode. Repository and branch
+names are relevance context, not authority to write another worktree's graph.
+
+Repository `edit_policy` applies only when the selected store is that
+repository's own canonical `.kin/local` or declared local store. Explicit
+profiles and user/global stores keep the user's edit policy, even when their
+data directory happens to be inside the repository tree.
 
 These references are deliberately session scoped, not durable graph identifiers. Broader graph discovery would need a persistent database identity and a binding to its configured global location or live worktree. A repository identity can group related worktrees for retrieval, while the branch and checkout path describe relevance. A removed worktree does not authorize another checkout to write to its graph; rebuilding tracked files with `git archive` does not recover its untracked `.kin/local` database.
 
