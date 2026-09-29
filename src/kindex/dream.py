@@ -793,6 +793,8 @@ def detach_dream(config: Config, mode: str = "lightweight", *, force: bool = Fal
         store.close()
         _release_lock(fd, config)
 
+    from .logstamp import ENV_VAR
+
     kin_path = _find_kin_path()
     log_dir = config.data_path / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -807,6 +809,7 @@ def detach_dream(config: Config, mode: str = "lightweight", *, force: bool = Fal
             stdout=log_fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
+            env={**os.environ, ENV_VAR: "1"},
         )
 
     return {

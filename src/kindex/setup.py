@@ -957,7 +957,7 @@ def install_launchd(config: "Config", dry_run: bool = False) -> list[str]:
         interval=interval,
         stdout_path=f"{log_dir}/cron.log",
         stderr_path=f"{log_dir}/cron-error.log",
-        environment={"PATH": scheduler_path(), "HOME": str(Path.home())},
+        environment=scheduler_environment(),
         working_directory=str(Path.home()),
     )
 
@@ -993,6 +993,21 @@ def cron_path_assignment() -> str:
     import shlex
 
     return "PATH=" + shlex.quote(scheduler_path()).replace("%", "\\%")
+
+
+def cron_env_assignments() -> str:
+    """Environment assignments that prefix every kindex crontab command."""
+    from .logstamp import ENV_VAR
+
+    return f"{cron_path_assignment()} {ENV_VAR}=1"
+
+
+def scheduler_environment() -> dict[str, str]:
+    """Environment for a launchd kin job. ``KIN_LOG_TIMESTAMPS`` makes kin
+    stamp each line it writes to the job's log with the time it happened."""
+    from .logstamp import ENV_VAR
+
+    return {"PATH": scheduler_path(), "HOME": str(Path.home()), ENV_VAR: "1"}
 
 
 def scheduler_path() -> str:
@@ -1143,7 +1158,7 @@ def install_crontab(config: "Config", dry_run: bool = False) -> list[str]:
     # reminder checker's :00/:05/... schedule. Each job carries the PATH its
     # actions need (cron's own PATH finds no agent CLI), refreshed on every
     # install.
-    env = cron_path_assignment()
+    env = cron_env_assignments()
     wanted = [
         (f"{kin_path} cron >> {log_dir}/cron.log 2>&1",
          f"2-59/30 * * * * {env} {kin_path} cron >> {log_dir}/cron.log 2>&1"),
@@ -1239,7 +1254,7 @@ def install_reminder_daemon(config: "Config", dry_run: bool = False) -> list[str
         interval=interval,
         stdout_path=f"{log_dir}/reminders.log",
         stderr_path=f"{log_dir}/reminders-error.log",
-        environment={"PATH": scheduler_path(), "HOME": str(Path.home())},
+        environment=scheduler_environment(),
         working_directory=str(Path.home()),
     )
 

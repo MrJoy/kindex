@@ -321,7 +321,7 @@ def _apply_crontab(interval: int, config: "Config") -> dict:
                  if "remind check" in l or not is_kindex_cron_line(l)]
 
     if interval > 0:
-        from .setup import _find_kin_path, cron_path_assignment
+        from .setup import _find_kin_path, cron_env_assignments
         kin_path = _find_kin_path()
         # Base-dir logs: repacks run once per profile pass, and the log
         # target must not drift to whichever profile's pass last changed
@@ -334,7 +334,7 @@ def _apply_crontab(interval: int, config: "Config") -> dict:
             pass  # best-effort: never let a log-dir failure break the repack
         # Convert interval to cron minutes (minimum 1)
         minutes = max(1, interval // 60)
-        env = cron_path_assignment()
+        env = cron_env_assignments()
         new_lines.append(
             f"*/{minutes} * * * * {env} {kin_path} cron >> {log_dir}/cron.log 2>&1")
 

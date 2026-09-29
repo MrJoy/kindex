@@ -236,7 +236,7 @@ def test_crontab_lines_carry_the_path(monkeypatch, config):
     ksetup.install_crontab(config)
     lines = [line for line in written["crontab"].splitlines() if line]
     assert len(lines) == 2
-    assert all("PATH=/opt/tools:/usr/bin /usr/local/bin/kin" in line for line in lines)
+    assert all("PATH=/opt/tools:/usr/bin KIN_LOG_TIMESTAMPS=1 /usr/local/bin/kin" in line for line in lines)
 
 
 def test_a_large_prompt_does_not_deadlock_a_chatty_child():
@@ -283,7 +283,7 @@ def test_rerunning_setup_refreshes_the_path_and_keeps_the_schedule(monkeypatch, 
     monkeypatch.setattr(ksetup, "scheduler_path", lambda: "/new/50%/bin:/usr/bin")
     ksetup.install_crontab(config)
     lines = [line for line in written["crontab"].splitlines() if line]
-    assert lines[0].startswith("*/7 * * * * PATH=/new/50\\%/bin:/usr/bin /usr/local/bin/kin cron")
+    assert lines[0].startswith("*/7 * * * * PATH=/new/50\\%/bin:/usr/bin KIN_LOG_TIMESTAMPS=1 /usr/local/bin/kin cron")
     assert lines[1].startswith("*/5 * * * * PATH=/new/50\\%/bin:/usr/bin ")
     assert "/old/bin" not in written["crontab"]
 

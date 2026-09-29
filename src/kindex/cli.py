@@ -8257,6 +8257,9 @@ def _record_hook_failure(args, exc: BaseException) -> None:
 
 
 def main():
+    from .logstamp import install_from_env
+
+    install_from_env()
     sys.excepthook = _redacted_excepthook
     from .store import (
         ProfileMismatchError,
