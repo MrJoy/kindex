@@ -55,6 +55,86 @@ def test_equal_cross_graph_hits_prefer_global(graphs):
     assert "id=global:" in output
 
 
+@pytest.mark.parametrize("filtered_secondary", [False, True])
+def test_existing_but_noncontributing_secondary_preserves_native_order_and_scores(
+    graphs, monkeypatch, filtered_secondary,
+):
+    import kindex.retrieve as retrieve
+
+    server, local, home, _ = graphs
+    semantic_id = local.add_node("Semantic local", tags=["relevant"])
+    literal_id = local.add_node("Literal local", tags=["relevant"])
+    global_id = home.add_node("Global filtered", tags=["other"])
+
+    def ranked_hybrid(store, query, **kwargs):
+        if store.read_only:
+            return ([{**store.get_node(global_id), "rrf_score": 0.8}]
+                    if filtered_secondary else [])
+        return [
+            {**store.get_node(semantic_id), "rrf_score": 0.9, "confidence": 0.1},
+            {**store.get_node(literal_id), "rrf_score": 0.1, "confidence": 0.9},
+        ]
+
+    monkeypatch.setattr(retrieve, "hybrid_search", ranked_hybrid)
+    output = server.search("literal local", tags="relevant" if filtered_secondary else "",
+                           top_k=2)
+
+    assert output.index("Semantic local") < output.index("Literal local")
+    assert "Semantic local (score=0.900" in output
+    assert "Literal local (score=0.100" in output
+    assert "rank_score=" not in output
+    assert "Global filtered" not in output
+
+
+@pytest.mark.parametrize("first_title", ["Semantic project", "Authoritative project"])
+def test_two_graph_merge_preserves_native_project_order(
+    graphs, monkeypatch, first_title,
+):
+    import kindex.retrieve as retrieve
+
+    server, local, home, _ = graphs
+    first_id = local.add_node(first_title)
+    literal_id = local.add_node("Literal project")
+    global_id = home.add_node("Global rank one")
+
+    def ranked_hybrid(store, query, **kwargs):
+        if store.read_only:
+            return [{**store.get_node(global_id), "rrf_score": 0.2, "confidence": 0.2}]
+        return [
+            {**store.get_node(first_id), "rrf_score": 0.1, "confidence": 0.1,
+             "standing": "authoritative" if first_title.startswith("Authoritative") else "present"},
+            {**store.get_node(literal_id), "rrf_score": 0.9, "confidence": 0.9},
+        ]
+
+    monkeypatch.setattr(retrieve, "hybrid_search", ranked_hybrid)
+    output = server.search("literal project", top_k=3)
+
+    assert output.index("Global rank one") < output.index(first_title)
+    assert output.index(first_title) < output.index("Literal project")
+    assert "rank_score=0.016393" in output
+    assert "score=0.900" not in output
+
+
+def test_cross_graph_merge_keeps_colliding_raw_ids_distinct(graphs, monkeypatch):
+    import kindex.retrieve as retrieve
+
+    server, local, home, _ = graphs
+    shared = "abc123def456"
+    local.add_node("Project copy", node_id=shared)
+    home.add_node("Global copy", node_id=shared)
+
+    def ranked_hybrid(store, query, **kwargs):
+        return [{**store.get_node(shared), "rrf_score": 0.5}]
+
+    monkeypatch.setattr(retrieve, "hybrid_search", ranked_hybrid)
+    output = server.search("shared", top_k=2)
+
+    assert "Found 2 results" in output
+    assert output.index("Global copy") < output.index("Project copy")
+    assert f"id={server._graph_ref('global', shared)}" in output
+    assert f"id={server._graph_ref('project', shared)}" in output
+
+
 @pytest.mark.parametrize("single_graph_reason", ["explicit_profile", "missing_global"])
 def test_single_graph_search_preserves_hybrid_order_and_scores(
     graphs, monkeypatch, single_graph_reason,

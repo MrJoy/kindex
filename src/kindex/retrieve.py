@@ -146,6 +146,39 @@ def _rrf_merge(*ranked_lists: list[tuple[str, float]], k: int = _RRF_K_DEFAULT) 
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
+def federate_graph_results(
+    project_hits: list[dict], global_hits: list[dict], *, top_k: int,
+    k: int = 60,
+) -> list[dict]:
+    """Federate graph-local rankings without comparing their score scales.
+
+    Each graph has already applied its own semantic, graph, and standing
+    ranking. A sole contributor keeps that order and native scores. With two
+    contributors, equal-weight RRF uses only local positions; ties at the same
+    position prefer global. Its score expresses rank, not calibrated relevance.
+    Identity is (graph, node ID), since raw IDs can collide across stores.
+    """
+    sources = (("global", global_hits), ("project", project_hits))
+    contributing = [(graph, hits) for graph, hits in sources if hits]
+    if len(contributing) == 1:
+        graph, hits = contributing[0]
+        return [{**hit, "_graph_source": graph} for hit in hits[:top_k]]
+
+    ranked = []
+    seen = set()
+    for graph, hits in contributing:
+        for rank, hit in enumerate(hits):
+            key = (graph, hit["id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            score = 1.0 / (k + rank + 1)
+            ranked.append((score, rank, graph != "global", hit["id"], graph, hit))
+    ranked.sort(key=lambda item: (-item[0], item[1], item[2], item[3]))
+    return [{**hit, "_graph_source": graph, "_merge_rank_score": score}
+            for score, _, _, _, graph, hit in ranked[:top_k]]
+
+
 def _normalize_scores(ranked: list[tuple[str, float]]) -> list[tuple[str, float]]:
     """Scale scores to [0, 1] by the best one. Preserves ordering.
 
