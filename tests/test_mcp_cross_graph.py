@@ -2,6 +2,7 @@
 
 import pytest
 import sqlite3
+import json
 
 pytest.importorskip("mcp")
 
@@ -233,6 +234,192 @@ def test_explicit_search_and_task_graph_scopes(graphs):
     assert "Foreign backlog item" not in server.task_list(
         graph="global", project_path=str(project))
     assert "Global scoped task" not in server.task_list(graph="global", scope="contextual")
+
+
+def test_listing_limits_and_colliding_node_refs_round_trip(graphs):
+    server, local, home, _ = graphs
+    shared = "abc123def456"
+    local.add_node("Project listing collision", node_id=shared, tags=["listprobe"])
+    home.add_node("Global listing collision", node_id=shared, tags=["listprobe"])
+
+    listed = server.list_nodes(tags="listprobe", limit=2)
+    assert "2 node(s)" in listed
+    assert server._graph_ref("project", shared) in listed
+    assert server._graph_ref("global", shared) in listed
+    assert "1 node(s)" in server.list_nodes(tags="listprobe", limit=1)
+    assert "Project listing collision" in server.list_nodes(
+        tags="listprobe", graph="project")
+    assert "Global listing collision" not in server.list_nodes(
+        tags="listprobe", graph="project")
+    ref = server._graph_ref("global", shared)
+    assert "Edited Global listing collision" in server.edit(ref, append="checked")
+    assert "checked" in home.get_node(shared)["content"]
+    assert "checked" not in local.get_node(shared)["content"]
+
+
+def test_status_graph_diagnostics_and_resources_separate_sources(graphs):
+    server, local, home, _ = graphs
+    local_id = local.add_node("Project diagnostic")
+    global_id = home.add_node("Global diagnostic")
+    global_peer = home.add_node("Global peer")
+    home.add_edge(global_id, global_peer)
+
+    status = server.status()
+    stats = server.graph_stats()
+    heal = server.graph_heal()
+    orient = server.orient()
+    resource = json.loads(server.resource_status())
+
+    for output in (status, stats, heal, orient):
+        assert "## Project graph" in output and "## Global graph" in output
+    assert resource["project"]["nodes"] == local.stats()["nodes"]
+    assert resource["global"]["nodes"] == home.stats()["nodes"]
+    assert "Global diagnostic" in stats
+    assert server._graph_ref("global", global_id) in stats
+    assert server._graph_ref("global", global_id) in heal
+    assert server._graph_ref("project", local_id) in orient
+    assert "Global diagnostic" not in stats.split("## Global graph")[0]
+    assert "Global diagnostic" not in heal.split("## Global graph")[0]
+    assert "Global diagnostic" in server.resource_recent()
+    assert server._graph_ref("global", global_id) in server.resource_recent()
+    assert server._graph_ref("project", local_id) in server.resource_orphans()
+
+
+def test_global_watch_suggestion_changelog_and_orphan_refs(graphs):
+    server, local, home, _ = graphs
+    local_a = local.add_node("Local suggestion origin")
+    local_b = local.add_node("Local suggestion target")
+    local.add_suggestion(local_a, local_b, identity_kind="node_id")
+    outer_id = home.add_node("Outer orphan")
+    watch_id = home.add_node("Outer watch", node_type="watch")
+    home.add_suggestion(outer_id, watch_id, identity_kind="node_id")
+
+    watches = server.watch_list()
+    suggestion = server.suggest()
+    changes = server.changelog(since="1970-01-01")
+    orphans = server.resource_orphans()
+
+    watch_ref = server._graph_ref("global", watch_id)
+    assert watch_ref in watches
+    assert f"global #1:" in suggestion
+    assert "project #1:" in suggestion
+    assert server._graph_ref("global", outer_id) in suggestion
+    assert server._graph_ref("project", local_a) in suggestion
+    assert "1 pending suggestion(s)" in server.suggest(limit=1)
+    assert server._graph_ref("global", outer_id) in changes
+    assert server._graph_ref("global", outer_id) in orphans
+    assert "Resolved watch" in server.watch_resolve(watch_ref)
+    assert home.get_node(watch_id)["status"] == "archived"
+    assert local.get_node(watch_id) is None
+
+
+def test_auto_resources_bound_combined_rows(graphs, monkeypatch):
+    server, local, home, _ = graphs
+    monkeypatch.setattr(server, "MAX_TOOL_ROWS", 2)
+    for i in range(3):
+        local.add_node(f"Project orphan {i}")
+        home.add_node(f"Global orphan {i}")
+
+    orphan_output = server.resource_orphans()
+    listed = server.list_nodes(limit=2)
+
+    assert orphan_output.count("id=") == 2
+    assert "more (use graph_heal or list_nodes)" in orphan_output
+    assert listed.count("id=") == 2
+
+
+def test_resource_status_keeps_flat_json_with_missing_secondary(graphs):
+    server, local, home, _ = graphs
+    local.add_node("Only selected graph")
+    home.close()
+    home.db_path.unlink(missing_ok=True)
+
+    resource = json.loads(server.resource_status())
+
+    assert resource == local.stats()
+    assert "project" not in resource and "global" not in resource
+    assert not home.db_path.exists()
+    assert server.status().startswith("# Kindex Status")
+    assert "Only selected graph" in server.list_nodes()
+    for tool in (server.list_nodes, server.status, server.suggest,
+                 server.graph_stats, server.graph_heal, server.changelog,
+                 server.watch_list, server.orient):
+        assert "unavailable or missing" in tool(graph="global")
+
+
+def test_changelog_discloses_truncation(graphs):
+    server, local, _, _ = graphs
+    for i in range(55):
+        local.add_node(f"Activity canary {i}")
+
+    output = server.changelog(since="1970-01-01", graph="project")
+
+    assert "Latest 50 change(s)" in output
+    assert "more may exist" in output
+
+
+def test_remaining_global_reads_are_read_only(graphs):
+    server, _, home, _ = graphs
+    node_id = home.add_node("Untouched outer read")
+    home.conn.execute("UPDATE nodes SET last_accessed='2000-01-01' WHERE id=?", (node_id,))
+    home.conn.commit()
+    before_schema = home.get_meta("schema_version")
+
+    outputs = (server.list_nodes(graph="global"), server.status(graph="global"),
+               server.graph_stats(graph="global"), server.graph_heal(graph="global"),
+               server.changelog(graph="global"), server.resource_recent(),
+               server.resource_orphans(), server.resource_status())
+
+    assert all(not output.startswith("Error:") for output in outputs)
+    assert home.conn.execute("SELECT last_accessed FROM nodes WHERE id=?",
+                             (node_id,)).fetchone()[0] == "2000-01-01"
+    assert home.get_meta("schema_version") == before_schema
+
+
+@pytest.mark.parametrize("tool", ["list_nodes", "status", "suggest", "graph_stats",
+                                  "graph_heal", "changelog", "watch_list", "orient"])
+def test_remaining_read_tools_reject_invalid_scope(graphs, tool):
+    server, _, _, _ = graphs
+    assert getattr(server, tool)(graph="invalid") == (
+        "Error: graph must be 'auto', 'project', or 'global'")
+
+
+def test_remaining_read_scopes_bypass_broken_secondary(graphs):
+    server, local, home, _ = graphs
+    local_id = local.add_node("Local read surface")
+    home.conn.execute("UPDATE meta SET value='3' WHERE key='schema_version'")
+    home.conn.commit()
+
+    scoped = [server.list_nodes(graph="project"), server.status(graph="project"),
+              server.suggest(graph="project"), server.graph_stats(graph="project"),
+              server.graph_heal(graph="project"), server.changelog(graph="project"),
+              server.watch_list(graph="project"), server.orient(graph="project")]
+    assert server._graph_ref("project", local_id) in scoped[0]
+    assert all(not output.startswith("Error:") for output in scoped)
+    auto = [server.list_nodes(), server.status(), server.suggest(),
+            server.graph_stats(), server.graph_heal(), server.changelog(),
+            server.watch_list(), server.orient(), server.resource_status(),
+            server.resource_recent(), server.resource_orphans()]
+    assert all(output.startswith("Error: memory unavailable (SchemaMigrationPending)")
+               for output in auto)
+    assert home.get_meta("schema_version") == "3"
+
+
+def test_remaining_read_surfaces_respect_explicit_profile(graphs):
+    server, local, home, _ = graphs
+    local.config.active_profile = "work"
+    local.add_node("Local profile listing")
+    home.add_node("Outer profile listing")
+
+    for output in (server.list_nodes(), server.status(), server.graph_stats(),
+                   server.graph_heal(), server.orient(), server.resource_recent(),
+                   server.resource_orphans()):
+        assert "Outer profile listing" not in output
+    assert "explicit profile" in server.list_nodes(graph="global")
+    assert "explicit profile" in server.status(graph="global")
+    assert "explicit profile" in server.graph_stats(graph="global")
+    assert "explicit profile" in server.graph_heal(graph="global")
+    assert "explicit profile" in server.orient(graph="global")
 
 
 @pytest.mark.parametrize("tool", ["context", "ask", "prime"])

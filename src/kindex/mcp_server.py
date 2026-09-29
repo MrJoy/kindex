@@ -692,12 +692,27 @@ def _state_error(exc: ValueError) -> str:
     return f"Error: {code}: {exc}"
 
 
-def _node_summary(node: dict) -> str:
+def _read_sources(selected, outer):
+    """Name stores yielded by _selected_read_stores in stable display order."""
+    return {name: source for name, source in
+            (("project", selected), ("global", outer)) if source is not None}
+
+
+def _read_rows(sources, fetch, limit: int) -> list[dict]:
+    """Fairly bound graph-local ordered lists without deduplicating raw IDs."""
+    from .retrieve import federate_graph_results
+
+    rows = {name: fetch(name, store, limit) for name, store in sources.items()}
+    return federate_graph_results(rows.get("project", []), rows.get("global", []),
+                                  top_k=limit)
+
+
+def _node_summary(node: dict, *, graph: str = "project") -> str:
     """One-line summary of a node."""
     ntype = node.get("type", "concept")
     title = node.get("title", node.get("id", "?"))
     weight = node.get("weight", 0)
-    display_id = _display_ref("project", node["id"])
+    display_id = _display_ref(graph, node["id"])
     return f"[{ntype}] {title} (w={weight:.2f}, id={display_id})"
 
 
@@ -1595,6 +1610,7 @@ def list_nodes(
     audience: str = "",
     tags: str = "",
     limit: int = 100,
+    graph: str = "auto",
 ) -> str:
     """List nodes in the knowledge graph with optional filters.
 
@@ -1604,33 +1620,32 @@ def list_nodes(
         audience: Filter by audience (private, team, org, public).
         tags: Filter by tags (comma-separated, AND logic — node must have all).
         limit: Maximum number of nodes to return.
+        graph: auto (both allowed stores), project, or global.
     """
-    store, _ = _get_store()
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
-    nodes = store.all_nodes(
-        node_type=node_type or None,
-        status=status or None,
-        audience=audience or None,
-        tags=tag_list,
-        limit=_bounded(limit),
-    )
+    try:
+        with _selected_read_stores(graph) as (selected, outer):
+            sources = _read_sources(selected, outer)
+            nodes = _read_rows(sources, lambda _, store, n: store.all_nodes(
+                node_type=node_type or None, status=status or None,
+                audience=audience or None, tags=tag_list, limit=n), _bounded(limit))
+    except ValueError as exc:
+        return f"Error: {exc}"
     if not nodes:
         return "No nodes found matching filters."
 
     lines = [f"{len(nodes)} node(s):\n"]
     for n in nodes:
-        lines.append(_node_summary(n))
+        lines.append(_node_summary(n, graph=n["_graph_source"]))
     return "\n".join(lines)
 
 
-@_tool()
-def status() -> str:
+def _status_one(store, source: str) -> str:
     """Get knowledge graph health and statistics.
 
     Returns node/edge counts, type distribution, orphan count,
     and active operational nodes (constraints, watches, directives).
     """
-    store, _ = _get_store()
     stats = store.stats()
     op = store.operational_summary()
     from .store import SCHEMA_RECOVERY_PATH_META, SCHEMA_RECOVERY_REASON_META
@@ -1675,7 +1690,8 @@ def status() -> str:
             f"{archive_duplicate_count} duplicate ID(s) need review"
         )
     if archive_failed_count:
-        sample = ", ".join(failure.id for failure in archive_failed[:5])
+        sample = ", ".join(_display_ref(source, failure.id)
+                           for failure in archive_failed[:5])
         lines.append(
             "Archive warning: "
             f"{archive_failed_count} node(s) could not be archived last cycle ({sample})"
@@ -1704,15 +1720,36 @@ def status() -> str:
     if constraints:
         lines.append(f"\n## Active Constraints ({len(constraints)})")
         for c in constraints[:10]:
-            lines.append(f"  - {c.get('title', c['id'])}")
+            lines.append(f"  - {c.get('title', c['id'])} "
+                         f"(id={_display_ref(source, c['id'])})"
+                         if _display_ref(source, c["id"]) != c["id"]
+                         else f"  - {c.get('title', c['id'])}")
 
     watches = op.get("watches", [])
     if watches:
         lines.append(f"\n## Active Watches ({len(watches)})")
         for w in watches[:10]:
-            lines.append(f"  - {w.get('title', w['id'])}")
+            lines.append(f"  - {w.get('title', w['id'])} "
+                         f"(id={_display_ref(source, w['id'])})"
+                         if _display_ref(source, w["id"]) != w["id"]
+                         else f"  - {w.get('title', w['id'])}")
 
     return "\n".join(lines)
+
+
+@_tool()
+def status(graph: str = "auto") -> str:
+    """Get per-graph health and statistics for the selected read scope."""
+    try:
+        with _selected_read_stores(graph) as (selected, outer):
+            sources = _read_sources(selected, outer)
+            if len(sources) == 1 and "project" in sources:
+                return _status_one(selected, "project")
+            return "\n\n".join(
+                f"## {source.title()} graph\n\n{_status_one(store, source)}"
+                for source, store in sources.items())
+    except ValueError as exc:
+        return f"Error: {exc}"
 
 
 @_tool()
@@ -1759,7 +1796,7 @@ def ask(question: str, graph: str = "auto") -> str:
 
 
 @_tool()
-def suggest(limit: int = 10) -> str:
+def suggest(limit: int = 10, graph: str = "auto") -> str:
     """Show pending bridge opportunity suggestions.
 
     These are potential connections between concepts that Kindex detected
@@ -1767,15 +1804,34 @@ def suggest(limit: int = 10) -> str:
 
     Args:
         limit: Maximum suggestions to show.
+        graph: auto (both allowed stores), project, or global.
     """
-    store, _ = _get_store()
-    suggestions = store.pending_suggestions(limit=limit)
+    try:
+        with _selected_read_stores(graph) as (selected, outer):
+            sources = _read_sources(selected, outer)
+            # Suggestion receipts are integers local to each store, not node IDs.
+            lists = {name: store.pending_suggestions(limit=_bounded(limit))
+                     for name, store in sources.items()}
+            suggestions = []
+            for rank in range(_bounded(limit)):
+                for name in ("global", "project"):
+                    if name in lists and rank < len(lists[name]):
+                        suggestions.append((name, lists[name][rank]))
+                        if len(suggestions) >= _bounded(limit):
+                            break
+                if len(suggestions) >= _bounded(limit):
+                    break
+    except ValueError as exc:
+        return f"Error: {exc}"
     if not suggestions:
         return "No pending suggestions."
 
     lines = [f"{len(suggestions)} pending suggestion(s):\n"]
-    for s in suggestions:
-        lines.append(f"  #{s['id']}: {s['concept_a']} <-> {s['concept_b']}")
+    for source, s in suggestions:
+        endpoint = lambda key: (_display_ref(source, s[key])
+                                if s.get("identity_kind") == "node_id" else s[key])
+        label = f"{source} #" if len(sources) > 1 or source == "global" else "#"
+        lines.append(f"  {label}{s['id']}: {endpoint('concept_a')} <-> {endpoint('concept_b')}")
         if s.get("reason"):
             lines.append(f"      Reason: {s['reason']}")
     return "\n".join(lines)
@@ -1912,10 +1968,8 @@ def learn(text: str, graph: str = "", source_refs: str = "") -> str:
     return ", ".join(parts)
 
 
-@_tool()
-def graph_stats() -> str:
-    """Get graph analytics: density, components, centrality, and communities."""
-    store, _ = _get_store()
+def _graph_stats_one(store, source: str) -> str:
+    """Compute analytics within one store; never combine graph topology."""
     from .graph import store_bridges, store_centrality, store_communities, store_stats
 
     stats = store_stats(store)
@@ -1950,19 +2004,39 @@ def graph_stats() -> str:
     if centrality:
         lines.append("\n## Top Nodes (Betweenness Centrality)")
         for nid, title, score in centrality:
-            lines.append(f"  {title}: {score:.4f}")
+            ref = _display_ref(source, nid)
+            lines.append(f"  {title}" + (f" (id={ref})" if ref != nid else "")
+                         + f": {score:.4f}")
 
     if communities:
         lines.append(f"\n## Communities ({len(communities)})")
         for i, comm in enumerate(communities[:5], 1):
-            members = ", ".join(n.get("title", n["id"]) for n in comm[:5])
+            members = ", ".join(
+                n.get("title", n["id"]) +
+                (f" (id={_display_ref(source, n['id'])})"
+                 if _display_ref(source, n["id"]) != n["id"] else "")
+                for n in comm[:5])
             lines.append(f"  Cluster {i} ({len(comm)} nodes): {members}")
 
     return "\n".join(lines)
 
 
 @_tool()
-def graph_heal() -> str:
+def graph_stats(graph: str = "auto") -> str:
+    """Get source-separated graph analytics for auto, project, or global."""
+    try:
+        with _selected_read_stores(graph) as (selected, outer):
+            sources = _read_sources(selected, outer)
+            if len(sources) == 1 and "project" in sources:
+                return _graph_stats_one(selected, "project")
+            return "\n\n".join(
+                f"## {source.title()} graph\n\n{_graph_stats_one(store, source)}"
+                for source, store in sources.items())
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+
+def _graph_heal_one(store, source: str) -> str:
     """Diagnose and report graph health issues with actionable recommendations.
 
     Reports:
@@ -1977,7 +2051,6 @@ def graph_heal() -> str:
     # Read-only by design: graph_heal performs no merges today. If a merge
     # is ever added here, it must call snapshots.snapshot_db first
     # (PRD lineage item 2 — pre-merge snapshot stopgap).
-    store, _ = _get_store()
     from .graph import store_bridges, store_stats
 
     lines = ["# Graph Health Report\n"]
@@ -1996,7 +2069,7 @@ def graph_heal() -> str:
         for o in orphans[:10]:
             weight = o.get('weight', 0)
             lines.append(f"  - [{o.get('type', '?')}] {o['title']} "
-                         f"(id={o['id']}, w={weight:.2f})")
+                         f"(id={_display_ref(source, o['id'])}, w={weight:.2f})")
             if weight < 0.15:
                 lines.append(f"    -> Low weight, candidate for archival")
             else:
@@ -2011,7 +2084,9 @@ def graph_heal() -> str:
     if bridges:
         lines.append(f"\n## Bridge Edges (critical connections)")
         for b in bridges:
-            lines.append(f"  - {b['from_title']} <-> {b['to_title']} "
+            lines.append(f"  - {b['from_title']} "
+                         f"(id={_display_ref(source, b['from_id'])}) <-> "
+                         f"{b['to_title']} (id={_display_ref(source, b['to_id'])}) "
                          f"(betweenness: {b['betweenness']:.4f})")
         lines.append("  -> Consider adding parallel links to reduce fragility")
 
@@ -2026,7 +2101,7 @@ def graph_heal() -> str:
             lines.append(f"\n## Fading Nodes ({len(low)} below 0.1 weight)")
             for r in low:
                 lines.append(f"  - [{r['type']}] {r['title']} "
-                             f"(id={r['id']}, w={r['weight']:.3f})")
+                             f"(id={_display_ref(source, r['id'])}, w={r['weight']:.3f})")
             lines.append("  -> Access these nodes to refresh weight, or let them fade to archive")
     except Exception:
         pass
@@ -2037,6 +2112,21 @@ def graph_heal() -> str:
         lines.append("  -> Use `suggest` to find cross-component link candidates")
 
     return "\n".join(lines)
+
+
+@_tool()
+def graph_heal(graph: str = "auto") -> str:
+    """Diagnose each allowed graph independently without modifying it."""
+    try:
+        with _selected_read_stores(graph) as (selected, outer):
+            sources = _read_sources(selected, outer)
+            if len(sources) == 1 and "project" in sources:
+                return _graph_heal_one(selected, "project")
+            return "\n\n".join(
+                f"## {source.title()} graph\n\n{_graph_heal_one(store, source)}"
+                for source, store in sources.items())
+    except ValueError as exc:
+        return f"Error: {exc}"
 
 
 @_tool()
@@ -2284,14 +2374,14 @@ def dream(
 
 
 @_tool()
-def changelog(since: str = "", days: int = 7) -> str:
+def changelog(since: str = "", days: int = 7, graph: str = "auto") -> str:
     """Show recent changes to the knowledge graph.
 
     Args:
         since: ISO date/timestamp to look back from (e.g. '2026-02-20').
         days: Look back N days from now (default 7, ignored if 'since' is set).
+        graph: auto (both allowed stores), project, or global.
     """
-    store, _ = _get_store()
     import datetime
 
     if since:
@@ -2300,7 +2390,23 @@ def changelog(since: str = "", days: int = 7) -> str:
         dt = datetime.datetime.now(tz=None) - datetime.timedelta(days=days)
         since_iso = dt.isoformat(timespec="seconds")
 
-    entries = store.activity_since(since_iso)
+    try:
+        with _selected_read_stores(graph) as (selected, outer):
+            sources = _read_sources(selected, outer)
+            entries = [(source, entry) for source, store in sources.items()
+                       for entry in store.activity_since(since_iso, limit=51)]
+            entries.sort(key=lambda item: (item[1].get("timestamp", ""),
+                                           item[0] == "global"), reverse=True)
+            truncated = len(entries) > 50
+            entries = entries[:50]
+            node_targets = {
+                (source, entry.get("target_id"))
+                for source, entry in entries
+                if entry.get("target_id") and
+                sources[source].peek_node(entry["target_id"]) is not None
+            }
+    except ValueError as exc:
+        return f"Error: {exc}"
     if not entries:
         return f"No changes since {since_iso}."
 
@@ -2311,15 +2417,23 @@ def changelog(since: str = "", days: int = 7) -> str:
         s = " ".join(s.split())
         return s if len(s) <= limit else s[:limit - 1] + "…"
 
-    lines = [f"{len(entries)} change(s) since {since_iso}:\n"]
-    for e in entries[:50]:
+    count_label = (f"Latest {len(entries)} change(s) since {since_iso} (more may exist)"
+                   if truncated else f"{len(entries)} change(s) since {since_iso}")
+    lines = [f"{count_label}:\n"]
+    for source, e in entries:
         ts = e.get("timestamp", "?")[:19]
         action = e.get("action", "?")
         target = e.get("target_title") or e.get("target_id") or "?"
+        target_id = e.get("target_id")
+        if (source, target_id) in node_targets:
+            display = _display_ref(source, target_id)
+            if display != target_id:
+                target += f" (id={display})"
         actor = e.get("actor", "")
         details = e.get("details") or {}
         actor_str = f" by {actor}" if actor else ""
-        lines.append(f"  {ts} {action} {target}{actor_str}")
+        label = f"[{source}] " if len(sources) > 1 or source == "global" else ""
+        lines.append(f"  {label}{ts} {action} {target}{actor_str}")
         # Compact per-field diff lines for edits
         diffs = details.get("diffs") if isinstance(details, dict) else None
         if isinstance(diffs, dict):
@@ -2380,9 +2494,11 @@ def ingest(source: str, limit: int = 0, repo: str = "", since: str = "") -> str:
 @_safe_output
 def resource_status() -> str:
     """Current knowledge graph statistics."""
-    store, _ = _get_store()
-    stats = store.stats()
-    return _json(stats, indent=2)
+    with _selected_read_stores() as (selected, outer):
+        sources = _read_sources(selected, outer)
+        if len(sources) == 1 and "project" in sources:
+            return _json(selected.stats(), indent=2)
+        return _json({source: store.stats() for source, store in sources.items()}, indent=2)
 
 
 @mcp.resource("kindex://node/{node_id}")
@@ -2411,9 +2527,13 @@ def resource_node(node_id: str) -> str:
 @_safe_output
 def resource_recent() -> str:
     """Recently active nodes in the knowledge graph."""
-    store, _ = _get_store()
-    nodes = store.recent_nodes(n=20)
-    lines = [_node_summary(n) for n in nodes]
+    with _selected_read_stores() as (selected, outer):
+        sources = _read_sources(selected, outer)
+        nodes = [(source, node) for source, store in sources.items()
+                 for node in store.recent_nodes(n=20)]
+        nodes.sort(key=lambda pair: (pair[1].get("updated_at", ""),
+                                     pair[0] == "global"), reverse=True)
+        lines = [_node_summary(node, graph=source) for source, node in nodes[:20]]
     return "\n".join(lines) if lines else "No recent nodes."
 
 
@@ -2421,14 +2541,18 @@ def resource_recent() -> str:
 @_safe_output
 def resource_orphans() -> str:
     """Nodes with no connections (candidates for linking or removal)."""
-    store, _ = _get_store()
-    orphans = store.orphans()
+    with _selected_read_stores() as (selected, outer):
+        sources = _read_sources(selected, outer)
+        lists = {source: store.orphans() for source, store in sources.items()}
+        orphans = _read_rows(sources, lambda source, _, limit: lists[source][:limit],
+                             MAX_TOOL_ROWS)
+        total = sum(len(rows) for rows in lists.values())
     if not orphans:
         return "No orphan nodes."
-    lines = [_node_summary(n) for n in orphans[:MAX_TOOL_ROWS]]
-    if len(orphans) > MAX_TOOL_ROWS:
-        lines.append(f"... {len(orphans) - MAX_TOOL_ROWS} more (use graph_heal or list_nodes)")
-    return f"{len(orphans)} orphan(s):\n" + "\n".join(lines)
+    lines = [_node_summary(n, graph=n["_graph_source"]) for n in orphans]
+    if total > MAX_TOOL_ROWS:
+        lines.append(f"... {total - MAX_TOOL_ROWS} more (use graph_heal or list_nodes)")
+    return f"{total} orphan(s):\n" + "\n".join(lines)
 
 
 # ── Prompts ───────────────────────────────────────────────────────────
@@ -2470,11 +2594,8 @@ def prime(topic: str = "", graph: str = "auto") -> str:
         return f"Error: {exc}"
 
 
-@mcp.prompt()
-@_safe_output
-def orient() -> str:
-    """Quick orientation: graph stats, recent activity, and key nodes."""
-    store, _ = _get_store()
+def _orient_one(store, source: str) -> str:
+    """One store's orientation, with source-bound node references."""
     from .graph import store_stats
 
     from .store import node_retired
@@ -2493,21 +2614,41 @@ def orient() -> str:
     if recent:
         lines.append("## Recently Active")
         for n in recent[:10]:
-            lines.append(f"  - {_node_summary(n)}")
+            lines.append(f"  - {_node_summary(n, graph=source)}")
 
     constraints = op.get("constraints", [])
     if constraints:
         lines.append(f"\n## Active Constraints ({len(constraints)})")
         for c in constraints[:5]:
-            lines.append(f"  - {c.get('title', c['id'])}")
+            ref = _display_ref(source, c["id"])
+            lines.append(f"  - {c.get('title', c['id'])}" +
+                         (f" (id={ref})" if ref != c["id"] else ""))
 
     watches = op.get("watches", [])
     if watches:
         lines.append(f"\n## Active Watches ({len(watches)})")
         for w in watches[:5]:
-            lines.append(f"  - {w.get('title', w['id'])}")
+            ref = _display_ref(source, w["id"])
+            lines.append(f"  - {w.get('title', w['id'])}" +
+                         (f" (id={ref})" if ref != w["id"] else ""))
 
     return "\n".join(lines)
+
+
+@mcp.prompt()
+@_safe_output
+def orient(graph: str = "auto") -> str:
+    """Quick source-separated orientation for auto, project, or global."""
+    try:
+        with _selected_read_stores(graph) as (selected, outer):
+            sources = _read_sources(selected, outer)
+            if len(sources) == 1 and "project" in sources:
+                return _orient_one(selected, "project")
+            return "\n\n".join(
+                f"## {source.title()} graph\n\n{_orient_one(store, source)}"
+                for source, store in sources.items())
+    except ValueError as exc:
+        return f"Error: {exc}"
 
 
 # ── Session tags ──────────────────────────────────────────────────────
@@ -3388,19 +3529,27 @@ def watch_add(text: str, owner: str = "", expires: str = "",
 
 
 @_tool()
-def watch_list(status: str = "active") -> str:
+def watch_list(status: str = "active", graph: str = "auto") -> str:
     """List watch nodes.
 
     Args:
         status: Filter by status: active (default), archived, all.
+        graph: auto (both allowed stores), project, or global.
     """
-    store, _ = _get_store()
-    if status == "all":
-        watches = store.all_nodes(node_type="watch", limit=50)
-    elif status == "archived":
-        watches = store.all_nodes(node_type="watch", status="archived", limit=50)
-    else:
-        watches = store.active_watches()
+    try:
+        with _selected_read_stores(graph) as (selected, outer):
+            sources = _read_sources(selected, outer)
+
+            def fetch(_, store, limit):
+                if status == "all":
+                    return store.all_nodes(node_type="watch", limit=limit)
+                if status == "archived":
+                    return store.all_nodes(node_type="watch", status="archived", limit=limit)
+                return store.active_watches()[:limit]
+
+            watches = _read_rows(sources, fetch, 50)
+    except ValueError as exc:
+        return f"Error: {exc}"
 
     if not watches:
         return "No watches found."
@@ -3408,7 +3557,7 @@ def watch_list(status: str = "active") -> str:
     lines = [f"Watches ({len(watches)}):"]
     for w in watches:
         extra = w.get("extra") or {}
-        parts = [f"- {w['title']} (id={_display_ref('project', w['id'])})"]
+        parts = [f"- {w['title']} (id={_display_ref(w['_graph_source'], w['id'])})"]
         if extra.get("owner"):
             parts.append(f"@{extra['owner']}")
         if extra.get("expires"):
