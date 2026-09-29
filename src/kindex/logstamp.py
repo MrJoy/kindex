@@ -7,8 +7,11 @@ prefixes each line with the local time its first character was written.
 Interactive and piped output stay untouched because nothing sets the
 variable there.
 
-Child processes that inherit the file descriptor write around the wrapper.
-A child ``kin`` inherits the variable too and stamps its own lines.
+``install_from_env`` removes the variable from the environment once read,
+so only the process whose stdout is the log stamps. A scheduled reminder
+action launches agents whose ``kin`` hooks answer in JSON on a captured
+stdout; an inherited opt-in would stamp that JSON and break it. Output a
+child writes to the inherited log descriptor stays unstamped.
 """
 
 from __future__ import annotations
@@ -61,8 +64,13 @@ class TimestampedStream:
 
 
 def install_from_env() -> None:
-    """Wrap sys.stdout and sys.stderr when the scheduler asked for stamps."""
-    if not enabled():
+    """Wrap sys.stdout and sys.stderr when the scheduler asked for stamps.
+
+    Consumes the variable so child processes never inherit the opt-in.
+    """
+    wanted = enabled()
+    os.environ.pop(ENV_VAR, None)
+    if not wanted:
         return
     for name in ("stdout", "stderr"):
         stream = getattr(sys, name)

@@ -160,3 +160,19 @@ def test_detached_dream_stamps_dream_log(monkeypatch, tmp_path):
     detach_dream(Config(data_dir=str(tmp_path)), mode="lightweight", force=True)
     assert seen["env"][logstamp.ENV_VAR] == "1"
     assert seen["env"]["PATH"]
+
+
+def test_children_do_not_inherit_the_opt_in(monkeypatch):
+    # A scheduled action launches agents whose kin hooks answer in JSON on a
+    # captured stdout. Only the process writing to the log may stamp.
+    import os
+    import subprocess
+
+    monkeypatch.setenv(logstamp.ENV_VAR, "1")
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    logstamp.install_from_env()
+    assert logstamp.ENV_VAR not in os.environ
+    child = subprocess.run([sys.executable, "-m", "kindex.cli", "--version"],
+                           capture_output=True, text=True, timeout=60)
+    assert child.stdout.startswith("kin ")
