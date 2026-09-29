@@ -81,6 +81,7 @@ class TestMCPAdd:
 
         assert f"Created node: {store.get_node_by_title('Single-store node')['id']} " in node
         assert f"Created task: {store.get_node_by_title('Single-store task')['id']} " in task
+        assert "project_path" not in store.get_node_by_title("Single-store task")["extra"]
         assert f"id={store.get_node_by_title('Single-store watch')['id']})" in watch
 
 

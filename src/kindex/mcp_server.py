@@ -2711,7 +2711,10 @@ def task_add(text: str, priority: int = 3, due: str = "",
         scope: 'global' (always visible) or 'contextual' (surfaces by proximity).
         link_to: Comma-separated node IDs or titles to link this task to.
         effort: Optional effort estimate (small, medium, large).
-        project_path: Explicit repository path; do not infer from the MCP process cwd.
+        project_path: Explicit repository path overrides the inferred association.
+            When omitted, a contextual task routed to the global graph from
+            an implicitly selected project is bound to that selected project
+            (not the MCP process cwd). Other creation keeps legacy behavior.
         session_id: Optional host conversation ID for contextual reminders.
         graph: project (selected graph) or global (configured outer graph).
         source_refs: Comma-separated graph-qualified evidence IDs. A global
@@ -2725,11 +2728,16 @@ def task_add(text: str, priority: int = 3, due: str = "",
     except ValueError as exc:
         return f"Could not create task: {exc}"
     from .tasks import create_task
+    task_project_path = project_path or None
+    if (task_project_path is None and scope == "contextual" and graph == "global"
+            and _graph_aware_session()):
+        _, selected_config = _get_store()
+        task_project_path = str(selected_config._project_path)
     try:
         task_id = create_task(
             store, text, priority=priority, due=due or None, scope=scope,
             effort=effort or None, link_to=links or None,
-            project_path=project_path or None, session_id=session_id or None,
+            project_path=task_project_path, session_id=session_id or None,
         )
     except ValueError as exc:
         return f"Could not create task: {exc}"

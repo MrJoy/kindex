@@ -635,6 +635,86 @@ def test_derived_task_and_qualified_update_stay_global(graphs):
     assert home.get_node_by_title("Impossible cross-store task") is None
 
 
+def test_global_derived_contextual_task_is_visible_to_bound_project(graphs):
+    server, local, home, project = graphs
+    source = home.add_node("Outer contextual source")
+    create_task(home, "Other project's task", project_path=str(project.parent / "other"))
+
+    result = server.task_add(
+        "Derived task for selected project",
+        source_refs=server._graph_ref("global", source))
+    task_ref = result.split("Created task: ", 1)[1].split(" ", 1)[0]
+    task_id = task_ref.rsplit(":", 1)[1]
+
+    assert task_ref.startswith("global:")
+    assert home.get_node(task_id)["extra"]["project_path"] == str(project)
+    assert local.get_node(task_id) is None
+    listed = server.task_list()
+    assert task_ref in listed
+    assert "Other project's task" not in listed
+    assert server.task_get(task_ref)["task"]["id"] == task_ref
+    updated = server.task_update(task_ref, priority=1)
+    assert updated["ok"] and updated["task"]["id"] == task_ref
+    assert home.get_node(task_id)["extra"]["priority"] == 1
+    assert local.edges_from(task_id) == []
+
+
+def test_global_contextual_task_uses_bound_project_after_cwd_env_changes(
+    graphs, tmp_path, monkeypatch,
+):
+    server, _, home, project = graphs
+    source = home.add_node("Bound project source")
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    monkeypatch.chdir(unrelated)
+    monkeypatch.setenv("PWD", str(unrelated))
+    monkeypatch.setenv("KIN_PROJECT", str(unrelated))
+    monkeypatch.setenv("KIN_PROJECT_PATH", str(unrelated))
+
+    result = server.task_add(
+        "Task retains selected project",
+        link_to=server._graph_ref("global", source))
+
+    assert "Created task: global:" in result
+    assert home.get_node_by_title("Task retains selected project")["extra"]["project_path"] == str(project)
+    assert "Task retains selected project" in server.task_list()
+
+
+def test_global_task_explicit_path_and_global_scope_are_not_inferred(graphs):
+    server, _, home, project = graphs
+    source = home.add_node("Scope source")
+    other = project.parent / "other"
+    other.mkdir()
+
+    explicit = server.task_add(
+        "Explicit other project", project_path=str(other),
+        source_refs=server._graph_ref("global", source))
+    global_task = server.task_add(
+        "Globally scoped derived task", scope="global",
+        source_refs=server._graph_ref("global", source))
+
+    assert "Created task: global:" in explicit
+    assert "Created task: global:" in global_task
+    assert home.get_node_by_title("Explicit other project")["extra"]["project_path"] == str(other)
+    assert "project_path" not in home.get_node_by_title("Globally scoped derived task")["extra"]
+    listed = server.task_list()
+    assert "Explicit other project" not in listed
+    assert "Globally scoped derived task" in listed
+    assert "Explicit other project" in server.task_list(graph="global")
+
+
+def test_explicit_profile_task_creation_keeps_single_store_scope(graphs):
+    server, local, home, _ = graphs
+    local.config.active_profile = "work"
+
+    result = server.task_add("Profile-local task")
+
+    task = local.get_node_by_title("Profile-local task")
+    assert f"Created task: {task['id']} " in result
+    assert "project_path" not in task["extra"]
+    assert home.get_node_by_title("Profile-local task") is None
+
+
 def test_global_watch_resolves_in_its_source_graph(graphs):
     server, local, home, _ = graphs
     watch_id = home.add_node("Global watch", node_type="watch")
