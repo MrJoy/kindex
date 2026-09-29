@@ -1148,12 +1148,98 @@ def supersede(node_id: str, new_text: str, expires: str = "", reason: str = "") 
     return f"Superseded {node['title']} ({old_ref}) -> new node {new_ref}"
 
 
+def _context_hits(stores, topic: str, top_k: int, client: str | None,
+                  *, trusted_only: bool, evaluation_time: str):
+    """Retrieve each graph independently before rank federation and rendering."""
+    from .retrieve import federate_graph_results, hybrid_search
+    from .store import node_expired, node_retired
+
+    hits = {}
+    warnings = {}
+    for graph, store in stores.items():
+        fence, grounding = {}, {}
+        if topic:
+            rows = hybrid_search(
+                store, topic, top_k=top_k, trusted_only=trusted_only,
+                evaluation_time=evaluation_time, fence_stats=fence,
+                grounding=grounding,
+            )
+        else:
+            recent = store.recent_nodes(n=top_k)
+            today = evaluation_time[:10] if trusted_only else None
+            expired = [r for r in recent if node_expired(r, today=today)]
+            inactive = [r for r in recent if r not in expired and node_retired(r)]
+            rows = [r for r in recent if r not in expired and r not in inactive]
+            if trusted_only:
+                from .trust import filter_trusted_nodes
+                rows, omissions = filter_trusted_nodes(store, rows, at=evaluation_time)
+                omissions["invalidated"] = omissions.get("invalidated", 0) + len(expired)
+                omissions["inactive"] = omissions.get("inactive", 0) + len(inactive)
+                fence["trusted_omissions"] = omissions
+        hits[graph] = _scope_results(rows, client)
+        warnings[graph] = (grounding, fence.get("trusted_omissions"))
+    merged = federate_graph_results(hits.get("project", []), hits.get("global", []),
+                                    top_k=top_k)
+    return merged, warnings
+
+
+def _render_context_sources(stores, results, warnings, *, topic: str, level: str,
+                            client: str | None, evaluation_time: str,
+                            trusted_only: bool = False, max_tokens: int = 0) -> str:
+    """Render graph-local sections; split one total budget across contributors."""
+    from .retrieve import (TIER_BUDGETS, _estimate_tokens, build_trust_note,
+                           format_context_block)
+
+    by_graph = {graph: [] for graph in stores}
+    for row in results:
+        by_graph[row["_graph_source"]].append(row)
+    contributing = [graph for graph in stores if by_graph[graph]]
+    if not contributing:
+        return ""
+    aware = _graph_aware_session()
+    total_budget = max_tokens if max_tokens > 0 else TIER_BUDGETS.get(level, 1500)
+    headings = len(contributing) > 1 or aware or "global" in contributing
+    denied = []
+    if trusted_only:
+        for graph in stores:
+            if graph not in contributing:
+                omissions = warnings[graph][1] or {}
+                if any(omissions.values()):
+                    denied.append(f"{graph.title()} graph: {build_trust_note(omissions)}")
+    preamble = "\n".join(denied)
+    if preamble:
+        preamble += "\n\n"
+    heading_cost = (_estimate_tokens(preamble)
+                    + _estimate_tokens("\n\n".join(
+                        f"## {graph.title()} graph\n\n" if headings else ""
+                        for graph in contributing)))
+    per_budget = max(1, (total_budget - heading_cost) // len(contributing))
+    sections = []
+    for graph in contributing:
+        grounding, omissions = warnings[graph]
+        kwargs = ({"max_tokens_approx": per_budget}
+                  if len(contributing) > 1 or max_tokens > 0 else {})
+        if max_tokens <= 0:
+            kwargs["level"] = level
+        formatter = ((lambda node_id, source=graph: _display_ref(source, node_id))
+                     if aware or graph == "global" else None)
+        block = format_context_block(
+            stores[graph], by_graph[graph], query=topic, adapter=client,
+            trusted_only=trusted_only, evaluation_time=evaluation_time,
+            grounding=grounding, reference_formatter=formatter,
+            trust_omissions=omissions if trusted_only else None, **kwargs,
+        )
+        sections.append((f"## {graph.title()} graph\n\n" if headings else "") + block)
+    return preamble + "\n\n".join(sections)
+
+
 @_tool()
 def context(
     topic: str = "",
     level: str = "abridged",
     max_tokens: int = 0,
     trusted_only: bool = False,
+    graph: str = "auto",
 ) -> str:
     """Get a formatted context block for injection into conversation.
 
@@ -1163,87 +1249,29 @@ def context(
         max_tokens: Token budget (overrides level with auto-selection if set).
         trusted_only: Admit only current, explicitly verified,
             non-contradicted knowledge. False preserves ordinary recall.
+        graph: Read scope: auto, project, or global.
     """
-    store, _ = _get_store()
-    from .retrieve import build_trust_note, format_context_block, hybrid_search
-    from .store import node_expired, node_retired
-
-    evaluation_time = None
-    fence_stats: dict = {}
-    if trusted_only:
-        evaluation_time = operation_now()
-
-    client = _mcp_client()
-    if topic:
-        results = hybrid_search(
-            store,
-            topic,
-            top_k=15,
-            trusted_only=trusted_only,
-            evaluation_time=evaluation_time,
-            fence_stats=fence_stats,
-        )
-    else:
-        # Fall back to recent high-weight nodes (skip expired and
-        # retired knowledge — archived/superseded stays retired here too)
-        recent = store.recent_nodes(n=15)
-        if trusted_only:
-            from .trust import parse_rfc3339
-            today = parse_rfc3339(
-                evaluation_time, field="evaluation_time"
-            ).date().isoformat()
-            expired_count = sum(
-                1 for result in recent if node_expired(result, today=today)
-            )
-            inactive_count = sum(
-                1 for result in recent
-                if not node_expired(result, today=today) and node_retired(result)
-            )
-            results = [
-                result for result in recent
-                if not node_expired(result, today=today) and not node_retired(result)
-            ]
-        else:
-            results = [
-                result for result in recent
-                if not node_expired(result) and not node_retired(result)
-            ]
-        if trusted_only:
-            from .trust import filter_trusted_nodes
-            results, omissions = filter_trusted_nodes(
-                store, results, at=evaluation_time
-            )
-            omissions["invalidated"] = (
-                omissions.get("invalidated", 0) + expired_count
-            )
-            omissions["inactive"] = omissions.get("inactive", 0) + inactive_count
-            fence_stats["trusted_omissions"] = omissions
-    results = _scope_results(results, client)
-
-    if not results:
-        result = "No relevant knowledge found."
-        if trusted_only:
-            result += "\n" + build_trust_note(fence_stats.get("trusted_omissions"))
-        return result
-
-    kwargs = {"level": level}
-    if max_tokens > 0:
-        kwargs = {"max_tokens_approx": max_tokens}
-
-    result = format_context_block(
-        store,
-        results,
-        query=topic,
-        adapter=client,
-        trusted_only=trusted_only,
-        evaluation_time=evaluation_time,
-        **kwargs,
-    )
-    if trusted_only:
-        result = result.rstrip() + "\n" + build_trust_note(
-            fence_stats.get("trusted_omissions")
-        )
-    return result
+    from .retrieve import build_trust_note
+    try:
+        with _selected_read_stores(graph) as (selected, outer):
+            stores = {name: source for name, source in
+                      (("project", selected), ("global", outer)) if source is not None}
+            now = operation_now()
+            client = _mcp_client()
+            results, warnings = _context_hits(
+                stores, topic, 15, client, trusted_only=trusted_only,
+                evaluation_time=now)
+            if not results:
+                notes = ("\n" + "\n".join(
+                    f"{name}: {build_trust_note(warnings[name][1])}" for name in stores)
+                         if trusted_only else "")
+                return "No relevant knowledge found." + notes
+            return _render_context_sources(
+                stores, results, warnings, topic=topic, level=level,
+                client=client, evaluation_time=now, trusted_only=trusted_only,
+                max_tokens=max_tokens)
+    except ValueError as exc:
+        return f"Error: {exc}"
 
 
 @_tool()
@@ -1688,7 +1716,7 @@ def status() -> str:
 
 
 @_tool()
-def ask(question: str) -> str:
+def ask(question: str, graph: str = "auto") -> str:
     """Ask a question of the knowledge graph.
 
     Classifies the question type (factual, procedural, decision, exploratory),
@@ -1696,10 +1724,8 @@ def ask(question: str) -> str:
 
     Args:
         question: Natural language question.
+        graph: Read scope: auto, project, or global.
     """
-    store, config = _get_store()
-    from .retrieve import format_context_block, hybrid_search
-
     # Simple question classification
     q_lower = question.lower()
     if any(p in q_lower for p in ["how do i", "how to", "steps to", "guide to"]):
@@ -1712,21 +1738,24 @@ def ask(question: str) -> str:
         qtype = "exploratory"
 
     top_k = {"factual": 5, "procedural": 8, "decision": 10, "exploratory": 12}.get(qtype, 10)
-    client = _mcp_client()
-    grounding: dict = {}
-    results = _scope_results(
-        hybrid_search(store, question, top_k=top_k, grounding=grounding), client)
-
-    if not results:
-        return f"[{qtype}] No relevant knowledge found for: {question}"
-
-    # The verdict rides through format_context_block, which is the single place
-    # rows become context text — so `ask` does not re-implement the gate, it
-    # just hands the verdict to the canonical renderer.
-    level = "full" if qtype in ("procedural", "decision") else "abridged"
-    block = format_context_block(store, results, query=question, level=level,
-                                 adapter=client, grounding=grounding)
-    return f"[{qtype} question]\n\n{block}"
+    try:
+        with _selected_read_stores(graph) as (selected, outer):
+            stores = {name: source for name, source in
+                      (("project", selected), ("global", outer)) if source is not None}
+            now = operation_now()
+            client = _mcp_client()
+            results, warnings = _context_hits(
+                stores, question, top_k, client, trusted_only=False,
+                evaluation_time=now)
+            if not results:
+                return f"[{qtype}] No relevant knowledge found for: {question}"
+            level = "full" if qtype in ("procedural", "decision") else "abridged"
+            block = _render_context_sources(
+                stores, results, warnings, topic=question, level=level,
+                client=client, evaluation_time=now)
+            return f"[{qtype} question]\n\n{block}"
+    except ValueError as exc:
+        return f"Error: {exc}"
 
 
 @_tool()
@@ -2407,34 +2436,38 @@ def resource_orphans() -> str:
 
 @mcp.prompt()
 @_safe_output
-def prime(topic: str = "") -> str:
+def prime(topic: str = "", graph: str = "auto") -> str:
     """Generate a full context priming block for the current session.
 
     Args:
         topic: Optional topic to focus on.
+        graph: Read scope: auto, project, or global.
     """
-    store, _ = _get_store()
-    from .retrieve import format_context_block, hybrid_search
-    from .store import node_expired, node_retired
-
-    client = _mcp_client()
-    if topic:
-        results = hybrid_search(store, topic, top_k=15)
-    else:
-        results = [r for r in store.recent_nodes(n=15)
-                   if not node_expired(r) and not node_retired(r)]
-    results = _scope_results(results, client)
-
-    if not results:
-        return "No knowledge available for priming."
-
-    stats = store.stats()
-    header = (
-        f"# Kindex Context\n\n"
-        f"Graph: {stats['nodes']} nodes, {stats['edges']} edges\n\n"
-    )
-    block = format_context_block(store, results, query=topic, level="full", adapter=client)
-    return header + block
+    try:
+        with _selected_read_stores(graph) as (selected, outer):
+            stores = {name: source for name, source in
+                      (("project", selected), ("global", outer)) if source is not None}
+            now = operation_now()
+            client = _mcp_client()
+            results, warnings = _context_hits(
+                stores, topic, 15, client, trusted_only=False, evaluation_time=now)
+            if not results:
+                return "No knowledge available for priming."
+            if len(stores) == 1 and not _graph_aware_session() and "project" in stores:
+                stats = selected.stats()
+                header = (f"# Kindex Context\n\n"
+                          f"Graph: {stats['nodes']} nodes, {stats['edges']} edges\n\n")
+            else:
+                counts = [f"{name.title()} graph: {stats['nodes']} nodes, "
+                          f"{stats['edges']} edges" for name, source in stores.items()
+                          for stats in [source.stats()]]
+                header = "# Kindex Context\n\n" + "\n".join(counts) + "\n\n"
+            block = _render_context_sources(
+                stores, results, warnings, topic=topic, level="full",
+                client=client, evaluation_time=now)
+            return header + block
+    except ValueError as exc:
+        return f"Error: {exc}"
 
 
 @mcp.prompt()

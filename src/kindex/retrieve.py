@@ -21,7 +21,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from .agent_adapters import adapter_scoped_out
 
@@ -848,7 +848,7 @@ def _graph_field(value):
     return value
 
 
-def _graph_node(node: dict) -> dict:
+def _graph_node(node: dict, reference_formatter: Callable[[str], str] | None = None) -> dict:
     """A copy of a node whose displayed text is safe to render."""
     if not isinstance(node, dict):
         return node
@@ -856,6 +856,9 @@ def _graph_node(node: dict) -> dict:
     for key in ("title", "type"):
         if key in safe and safe[key] is not None:
             safe[key] = graph_text(safe[key], single_line=True)
+    if reference_formatter and safe.get("id"):
+        ref = graph_text(reference_formatter(safe["id"]), single_line=True)
+        safe["title"] = f"{safe.get('title') or safe['id']} [{ref}]"
     if safe.get("content"):
         safe["content"] = graph_text(safe["content"])
     for key in ("aka", "domains", "tags", "prov_source", "prov_when",
@@ -865,7 +868,9 @@ def _graph_node(node: dict) -> dict:
     if isinstance(safe.get("edges_out"), list):
         safe["edges_out"] = [
             {**edge,
-             "to_title": graph_text(edge.get("to_title") or edge.get("to_id"), single_line=True),
+             "to_title": (graph_text(edge.get("to_title") or edge.get("to_id"), single_line=True)
+                          + (f" [{graph_text(reference_formatter(edge['to_id']), single_line=True)}]"
+                             if reference_formatter and edge.get("to_id") else "")),
              "type": _graph_field(edge.get("type"))}
             if isinstance(edge, dict) else edge
             for edge in safe["edges_out"]
@@ -881,22 +886,24 @@ class _GraphTextStore:
     """The store as the formatters see it: every node they pull for display
     carries safe text; everything else passes through."""
 
-    def __init__(self, store: Store) -> None:
+    def __init__(self, store: Store, reference_formatter: Callable[[str], str] | None = None) -> None:
         self._store = store
+        self._reference_formatter = reference_formatter
 
     def __getattr__(self, name: str):
         return getattr(self._store, name)
 
     def all_nodes(self, *args, **kwargs):
-        return [_graph_node(node) for node in self._store.all_nodes(*args, **kwargs)]
+        return [_graph_node(node, self._reference_formatter)
+                for node in self._store.all_nodes(*args, **kwargs)]
 
     def get_node(self, *args, **kwargs):
         node = self._store.get_node(*args, **kwargs)
-        return _graph_node(node) if node is not None else None
+        return _graph_node(node, self._reference_formatter) if node is not None else None
 
     def operational_summary(self, *args, **kwargs):
         return {
-            key: [_graph_node(node) for node in values]
+            key: [_graph_node(node, self._reference_formatter) for node in values]
             for key, values in self._store.operational_summary(*args, **kwargs).items()
         }
 
@@ -911,6 +918,8 @@ def format_context_block(
     trusted_only: bool = False,
     evaluation_time: str | datetime | None = None,
     grounding: dict | None = None,
+    reference_formatter: Callable[[str], str] | None = None,
+    trust_omissions: dict[str, int] | None = None,
 ) -> str:
     """Format search results as a context block for CLAUDE.md injection.
 
@@ -965,12 +974,14 @@ def format_context_block(
         except Exception:
             note = ""
     prefix = f"{note}\n\n" if note else ""
+    if trust_omissions is not None:
+        prefix += build_trust_note(trust_omissions) + "\n\n"
     prefix += GRAPH_DATA_NOTE + "\n\n"
 
     from .kinbase import evidence_note
 
-    display_store = _GraphTextStore(store)
-    display_results = [_graph_node(node) for node in results]
+    display_store = _GraphTextStore(store, reference_formatter)
+    display_results = [_graph_node(node, reference_formatter) for node in results]
 
     def annotated(count):
         selected = display_results[:count]
@@ -979,8 +990,11 @@ def format_context_block(
         # annotated: a tier showing fewer rows than it was given (a budget,
         # the executive top five) left notes about nothing on the page.
         annotations = "\n\n".join(
-            graph_text(f"Evidence for {node.get('title') or node['id']} [{node['id']}]:",
-                       240, single_line=True) + "\n" + graph_text(note)
+            (f"Evidence for {graph_text(node.get('title') or node['id'], 120, single_line=True)} "
+             f"[{graph_text(reference_formatter(node['id']), single_line=True) if reference_formatter else node['id']}]:"
+             if reference_formatter else
+             graph_text(f"Evidence for {node.get('title') or node['id']} [{node['id']}]:",
+                        240, single_line=True)) + "\n" + graph_text(note)
             for node, shown in zip(results[:count], selected)
             if (note := evidence_note(node)) and str(shown.get("title") or shown["id"]) in body
         )
@@ -994,11 +1008,17 @@ def format_context_block(
         if _estimate_tokens(prefix + output) <= budget:
             return prefix + output
 
-    # Even one result exceeds budget — return truncated
+    # Even one result exceeds budget. Protected grounding/trust framing stays
+    # intact; if it consumes the allotment, omit the graph payload entirely.
+    if _estimate_tokens(prefix) >= budget:
+        return prefix
     output = annotated(1)
-    max_chars = budget * 4 - len(prefix)
+    marker = "\n\n*[truncated to fit token budget]*"
+    max_chars = max(0, budget * 4 - len(prefix) - len(marker))
+    if max_chars == 0:
+        return prefix
     if len(output) > max_chars:
-        output = output[:max_chars] + "\n\n*[truncated to fit token budget]*"
+        output = output[:max_chars] + marker
     return prefix + output
 
 

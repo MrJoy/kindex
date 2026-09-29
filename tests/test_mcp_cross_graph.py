@@ -235,6 +235,207 @@ def test_explicit_search_and_task_graph_scopes(graphs):
     assert "Global scoped task" not in server.task_list(graph="global", scope="contextual")
 
 
+@pytest.mark.parametrize("tool", ["context", "ask", "prime"])
+def test_context_tools_discover_global_and_return_editable_ref(graphs, tool):
+    server, local, home, _ = graphs
+    node_id = home.add_node("Outer atlas fact", content="outeratlasprobe")
+    ref = server._graph_ref("global", node_id)
+
+    output = (server.ask("what is outeratlasprobe") if tool == "ask" else
+              getattr(server, tool)(topic="outeratlasprobe"))
+
+    assert "Outer atlas fact" in output
+    assert ref in output
+    assert "Edited Outer atlas fact" in server.edit(ref, append="confirmed")
+    assert "confirmed" in home.get_node(node_id)["content"]
+    assert local.get_node(node_id) is None
+
+
+def test_context_sections_keep_colliding_ids_and_edges_in_own_graph(graphs):
+    server, local, home, _ = graphs
+    shared = "abc123def456"
+    local.add_node("Project collision", content="collidingcontextprobe", node_id=shared)
+    home.add_node("Global collision", content="collidingcontextprobe", node_id=shared)
+    target = home.add_node("Outer connection", content="connection detail")
+    home.add_edge(shared, target)
+
+    output = server.context(topic="collidingcontextprobe", level="full")
+
+    assert output.count("## Project graph") == 1
+    assert output.count("## Global graph") == 1
+    assert server._graph_ref("project", shared) in output
+    assert server._graph_ref("global", shared) in output
+    assert f"Outer connection [{server._graph_ref('global', target)}]" in output
+    assert "Outer connection" not in output.split("## Global graph")[0]
+    assert "Project collision" not in output.split("## Global graph")[1]
+
+
+def test_empty_topic_context_and_prime_read_both_and_count_sources(graphs):
+    server, local, home, _ = graphs
+    local.add_node("Recent project canary")
+    outer_id = home.add_node("Recent outer canary")
+
+    context = server.context()
+    prime = server.prime()
+
+    assert "Recent project canary" in context
+    assert "Recent outer canary" in context
+    assert server._graph_ref("global", outer_id) in context
+    assert "Recent project canary" in prime
+    assert "Recent outer canary" in prime
+    assert "Project graph:" in prime and "Global graph:" in prime
+
+
+def test_context_project_scope_avoids_broken_secondary_and_profile_isolates(graphs):
+    server, local, home, _ = graphs
+    local_id = local.add_node("Project context safe", content="localsafecontextprobe")
+    home.add_node("Outer context", content="localsafecontextprobe")
+    home.conn.execute("UPDATE meta SET value='3' WHERE key='schema_version'")
+    home.conn.commit()
+
+    for tool in (lambda: server.context(topic="localsafecontextprobe", graph="project"),
+                 lambda: server.ask("what is localsafecontextprobe", graph="project"),
+                 lambda: server.prime(topic="localsafecontextprobe", graph="project")):
+        result = tool()
+        assert server._graph_ref("project", local_id) in result
+        assert "Outer context" not in result
+    for tool in (lambda: server.context(topic="localsafecontextprobe"),
+                 lambda: server.ask("what is localsafecontextprobe"),
+                 lambda: server.prime(topic="localsafecontextprobe")):
+        assert tool().startswith("Error: memory unavailable (SchemaMigrationPending)")
+    assert home.get_meta("schema_version") == "3"
+    local.config.active_profile = "work"
+    for tool in (lambda: server.context(topic="localsafecontextprobe"),
+                 lambda: server.ask("what is localsafecontextprobe"),
+                 lambda: server.prime(topic="localsafecontextprobe")):
+        assert "Project context safe" in tool()
+    assert "explicit profile" in server.context(graph="global")
+
+
+def test_context_global_grounding_and_trusted_empty_source_warning(graphs, monkeypatch):
+    import kindex.retrieve as retrieve
+    from kindex.grounding import RetrievalVerdict, UNGROUNDED
+
+    server, local, home, _ = graphs
+    project_id = local.add_node("Verified project", content="trustcontextprobe")
+    home.add_node("Unverified outer", content="trustcontextprobe")
+    local.verify_node(project_id, verified_by="tester", prov_method="inspection")
+    original = retrieve.hybrid_search
+
+    def grounded(store, query, *, grounding=None, **kwargs):
+        rows = original(store, query, grounding=grounding, **kwargs)
+        if store.read_only:
+            grounding["verdict"] = RetrievalVerdict(
+                verdict=UNGROUNDED, floor=0.8, best_similarity=0.2)
+        return rows
+
+    monkeypatch.setattr(retrieve, "hybrid_search", grounded)
+    assert "UNGROUNDED" in server.ask("what is trustcontextprobe")
+    output = server.context(topic="trustcontextprobe", trusted_only=True)
+    assert "Verified project" in output
+    assert "Unverified outer" not in output
+    assert "Global graph: (trusted-only omissions: legacy/unverified=1)" in output
+
+
+def test_context_small_budget_is_split_and_auto_selects_tier(graphs):
+    from kindex.retrieve import _estimate_tokens
+
+    server, local, home, _ = graphs
+    local.add_node("Project budget", content="budgetcontextprobe " * 100)
+    home.add_node("Global budget", content="budgetcontextprobe " * 100)
+
+    output = server.context(topic="budgetcontextprobe", level="full", max_tokens=300)
+
+    assert "Project budget" in output and "Global budget" in output
+    assert "**Level:** full" not in output
+    assert _estimate_tokens(output) <= 315  # rounding across two sections
+
+
+def test_context_auxiliary_refs_and_evidence_use_source_identity(graphs, monkeypatch):
+    import kindex.kinbase as kinbase
+
+    server, _, home, _ = graphs
+    result_id = home.add_node("Outer main fact", content="auxiliarycontextprobe")
+    question_id = home.add_node("Outer open question", node_type="question")
+    decision_id = home.add_node("Outer recent decision", node_type="decision")
+    watch_id = home.add_node("Outer active watch", node_type="watch",
+                             extra={"owner": "tester"})
+    monkeypatch.setattr(kinbase, "evidence_note",
+                        lambda node: "source evidence" if node["id"] == result_id else "")
+
+    output = server.context(topic="auxiliarycontextprobe", graph="global", level="full")
+
+    for node_id in (result_id, question_id, decision_id, watch_id):
+        assert server._graph_ref("global", node_id) in output
+    assert f"Evidence for Outer main fact [{server._graph_ref('global', result_id)}]:" in output
+
+
+def test_context_uses_one_evaluation_instant_across_graphs(graphs, monkeypatch):
+    import kindex.retrieve as retrieve
+
+    server, local, home, _ = graphs
+    local.add_node("Project instant", content="instantcontextprobe")
+    home.add_node("Global instant", content="instantcontextprobe")
+    instants = []
+    original = retrieve.hybrid_search
+
+    def observe(store, query, *, evaluation_time=None, **kwargs):
+        instants.append(evaluation_time)
+        return original(store, query, evaluation_time=evaluation_time, **kwargs)
+
+    monkeypatch.setattr(retrieve, "hybrid_search", observe)
+    monkeypatch.setattr(server, "operation_now", lambda: "2026-09-28T12:00:00Z")
+
+    assert "Project instant" in server.context(topic="instantcontextprobe")
+    assert instants == ["2026-09-28T12:00:00Z"] * 2
+
+
+def test_recent_context_keeps_legacy_local_day_expiry(graphs, monkeypatch):
+    import kindex.store as store_module
+
+    server, local, _, _ = graphs
+    local.add_node("Local date canary")
+    observed = []
+    original = store_module.node_expired
+
+    def expiry(node, today=None):
+        if node.get("title") == "Local date canary":
+            observed.append(today)
+        return original(node, today=today)
+
+    monkeypatch.setattr(store_module, "node_expired", expiry)
+    monkeypatch.setattr(server, "operation_now", lambda: "2026-09-28T00:00:00Z")
+
+    assert "Local date canary" in server.context(graph="project")
+    assert "Local date canary" in server.prime(graph="project")
+    assert observed == [None, None]
+
+
+def test_context_client_filter_and_outer_read_does_not_touch_access_time(graphs, monkeypatch):
+    server, _, home, _ = graphs
+    allowed = home.add_node("Claude scoped outer", content="clientcontextprobe",
+                            tags=["client:claude"])
+    home.add_node("Other client outer", content="clientcontextprobe",
+                  tags=["client:codex"])
+    home.conn.execute("UPDATE nodes SET last_accessed='2000-01-01' WHERE id=?", (allowed,))
+    home.conn.commit()
+    monkeypatch.setenv("KIN_CLIENT", "claude")
+
+    output = server.context(topic="clientcontextprobe")
+
+    assert "Claude scoped outer" in output
+    assert "Other client outer" not in output
+    assert home.conn.execute("SELECT last_accessed FROM nodes WHERE id=?", (allowed,)).fetchone()[0] == "2000-01-01"
+
+
+@pytest.mark.parametrize("tool", ["context", "ask", "prime"])
+def test_context_tools_reject_invalid_graph_scope(graphs, tool):
+    server, _, _, _ = graphs
+    result = (server.ask("anything", graph="wrong") if tool == "ask" else
+              getattr(server, tool)(graph="wrong"))
+    assert result == "Error: graph must be 'auto', 'project', or 'global'"
+
+
 @pytest.mark.parametrize("tool", ["search", "task_list"])
 def test_invalid_read_graph_scope_is_ordinary_error(graphs, tool):
     server, _, _, _ = graphs

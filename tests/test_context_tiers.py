@@ -1,6 +1,7 @@
 """Tests for five-tier context retrieval system."""
 
 import pytest
+from types import SimpleNamespace
 
 from kindex.config import Config
 from kindex.retrieve import (
@@ -65,6 +66,7 @@ class TestOperationalScoping:
             store, results, query="stigmergy", level="full", adapter="antigravity")
         store.close()
 
+
     def test_mcp_scope_results_filters_foreign_client(self):
         from kindex.mcp_server import _scope_results
         rows = [{"id": "a", "tags": ["antigravity"]}, {"id": "b", "tags": ["systems"]}]
@@ -73,6 +75,21 @@ class TestOperationalScoping:
         # ...kept for its own client, and unfiltered when no client is set.
         assert [r["id"] for r in _scope_results(rows, "antigravity")] == ["a", "b"]
         assert [r["id"] for r in _scope_results(rows, None)] == ["a", "b"]
+
+
+def test_tiny_budget_preserves_grounding_warning_without_graph_payload(populated_store):
+    from kindex.retrieve import GRAPH_DATA_NOTE
+
+    node = populated_store.get_node("stig")
+    block = format_context_block(
+        populated_store, [node], max_tokens_approx=8,
+        grounding={"verdict": SimpleNamespace(note=lambda: "UNGROUNDED warning")},
+    )
+
+    assert "UNGROUNDED warning" in block
+    assert GRAPH_DATA_NOTE in block
+    assert "Coordination through environmental traces" not in block
+    assert len(block) < 200
 
 
 class TestAutoSelectTier:
