@@ -8,6 +8,7 @@ Google Antigravity, OpenCode, Cursor, and other MCP clients)
 from __future__ import annotations
 
 import atexit
+from contextlib import contextmanager
 import functools
 import json
 import os
@@ -294,41 +295,40 @@ def _global_store(store, config, *, write=False):
     """
     from .project_store import is_project_store
     from .store import Store
-    from pathlib import Path
 
     project = str(config._project_path) if config._project_path else ""
     home_dir = getattr(config, "_global_data_dir", None)
-    if (not project or not home_dir or config.active_profile
-            or not is_project_store(store, project)):
+    if not project or not home_dir or config.active_profile:
         return None
     from .config import Config, record_degraded
 
-    home_config = Config(**config._global_config_data)
-    home_config.data_dir = home_dir
-    # Profiles are a user-only layer, already anchored to their declaring
-    # config file by load_config. Project edit_policy and other local settings
-    # must never govern the outer graph.
-    home_config.profiles = config.profiles
-    matching_profiles = [name for name, entry in config.profiles.items()
-                         if entry.data_dir and
-                         home_config.data_path.resolve() ==
-                         Path(entry.data_dir).expanduser().resolve()]
-    if len(matching_profiles) > 1:
-        raise ValueError("Configured global data directory matches multiple profiles")
-    home_config.active_profile = matching_profiles[0] if matching_profiles else None
-    # Selecting a secondary target does not claim or stamp a user database.
-    home_config._stamp_on_open = False
-    if home_config.data_path.resolve() == config.data_path.resolve():
-        return None
-    key = str(home_config.data_path.resolve())
-    if write and key in _global_write_stores:
-        return _global_write_stores[key]
-    home = Store(home_config, read_only=not write, manage_project_storage=False)
-    if not home.db_path.is_file():
-        return None
-    # Fail visibly if an existing secondary graph is unreadable; silently
-    # returning only project results would recreate the original false negative.
+    home = None
     try:
+        if not is_project_store(store, project):
+            return None
+        home_config = Config(**config._global_config_data)
+        home_config.data_dir = home_dir
+        # Profiles are anchored to the user config, not the project config.
+        home_config.profiles = config.profiles
+        matching_profiles = [name for name, entry in config.profiles.items()
+                             if entry.data_dir and
+                             home_config.data_path.resolve() ==
+                             Path(entry.data_dir).expanduser().resolve()]
+        if len(matching_profiles) > 1:
+            raise ValueError("Configured global data directory matches multiple profiles")
+        home_config.active_profile = matching_profiles[0] if matching_profiles else None
+        # A secondary read must not claim, stamp, create, or migrate a user DB.
+        home_config._stamp_on_open = False
+        if home_config.data_path.resolve() == config.data_path.resolve():
+            return None
+        key = str(home_config.data_path.resolve())
+        if write and key in _global_write_stores:
+            return _global_write_stores[key]
+        home = Store(home_config, read_only=not write, manage_project_storage=False)
+        if not home.db_path.is_file():
+            home.close()
+            return None
+        # An existing but unreadable secondary must fail visibly.
         home.conn
         if not home_config.active_profile:
             row = home.conn.execute(
@@ -336,10 +336,11 @@ def _global_store(store, config, *, write=False):
             if row is not None:
                 raise ValueError("Configured global graph is stamped for a different profile")
     except Exception as error:
-        try:
-            home.close()
-        except Exception:
-            pass
+        if home is not None:
+            try:
+                home.close()
+            except Exception:
+                pass
         try:
             record_degraded("mcp", error, config=config)
         except Exception:
@@ -353,6 +354,36 @@ def _global_store(store, config, *, write=False):
 
 def _global_read_store(store, config):
     return _global_store(store, config)
+
+
+@contextmanager
+def _selected_read_stores(graph: str = "auto"):
+    """Yield selected and optional outer read stores without changing the singleton.
+
+    Explicit project reads never initialize the secondary. The caller owns
+    neither store; this context closes only the temporary outer read handle.
+    """
+    if graph not in ("auto", "project", "global"):
+        raise ValueError("graph must be 'auto', 'project', or 'global'")
+    selected, config = _get_store()
+    if graph == "project":
+        yield selected, None
+        return
+    if graph == "global" and config.active_profile:
+        raise ValueError("Global graph is unavailable with an explicit profile")
+    outer = _global_read_store(selected, config)
+    if graph == "global" and outer is None:
+        raise ValueError("Configured global graph is unavailable or missing")
+    try:
+        yield (selected if graph == "auto" else None), outer
+    finally:
+        if outer is not None:
+            active_error = sys.exc_info()[0]
+            try:
+                outer.close()
+            except Exception as close_error:
+                if active_error is None:
+                    raise MemoryUnavailableError(close_error) from close_error
 
 
 def _graph_ref(graph: str, node_id: str) -> str:
@@ -396,6 +427,12 @@ def _display_task_record(record: dict | None, graph: str,
             _display_ref(graph, dependency, incoming_ref=incoming_ref)
             for dependency in record["dependencies"]]
     return record
+
+
+def _task_with_graph_ref(task: dict, graph: str) -> dict:
+    ref = _display_ref(graph, task["id"])
+    return ({**task, "_graph_source": graph, "_graph_ref": ref}
+            if ref != task["id"] else task)
 
 
 def _split_graph_ref(ref: str) -> tuple[str, str] | None:
@@ -737,7 +774,7 @@ def kinbase_sync(repo: str, mode: str = "auto") -> str:
 @_tool()
 def search(query: str, top_k: int = 10, tags: str = "",
            include_archived: bool = False,
-           trusted_only: bool = False) -> str:
+           trusted_only: bool = False, graph: str = "auto") -> str:
     """Search the knowledge graph with hybrid FTS5 + graph traversal.
 
     USE THIS: before starting work on a topic, before adding nodes (to avoid
@@ -756,8 +793,9 @@ def search(query: str, top_k: int = 10, tags: str = "",
         include_archived: Include archived nodes (fenced from default search).
         trusted_only: Admit only current, explicitly verified, non-contradicted
             knowledge. False preserves ordinary legacy-compatible recall.
+        graph: auto (selected project plus configured outer), project (selected
+            store only), or global (configured outer store only).
     """
-    store, config = _get_store()
     from .retrieve import federate_graph_results, hybrid_search
 
     fence_stats: dict = {}
@@ -765,34 +803,34 @@ def search(query: str, top_k: int = 10, tags: str = "",
     top_k = _bounded(top_k)
     fetch_k = top_k * 3 if tags else top_k
     evaluation_time = operation_now() if trusted_only else None
-    results = hybrid_search(store, query, top_k=fetch_k,
-                            include_archived=include_archived,
-                            fence_stats=fence_stats,
-                            trusted_only=trusted_only,
-                            evaluation_time=evaluation_time,
-                            grounding=grounding)
-
-    home = _global_read_store(store, config)
+    results = []
     home_results = []
     home_grounding: dict = {}
-    if home is not None:
-        try:
-            home_fence: dict = {}
-            home_results = hybrid_search(
-                home, query, top_k=fetch_k,
-                include_archived=include_archived, fence_stats=home_fence,
-                trusted_only=trusted_only, evaluation_time=evaluation_time,
-                grounding=home_grounding)
-            fence_stats["fenced_nodes"] = (fence_stats.get("fenced_nodes", [])
-                                             + home_fence.get("fenced_nodes", []))
-            fence_stats["candidate_count"] = (fence_stats.get("candidate_count", 0)
-                                               + home_fence.get("candidate_count", 0))
-            if trusted_only:
-                omissions = fence_stats.setdefault("trusted_omissions", {})
-                for reason, count in home_fence.get("trusted_omissions", {}).items():
-                    omissions[reason] = omissions.get(reason, 0) + count
-        finally:
-            home.close()
+    try:
+        with _selected_read_stores(graph) as (selected, home):
+            if selected is not None:
+                results = hybrid_search(
+                    selected, query, top_k=fetch_k,
+                    include_archived=include_archived, fence_stats=fence_stats,
+                    trusted_only=trusted_only, evaluation_time=evaluation_time,
+                    grounding=grounding)
+            if home is not None:
+                home_fence: dict = {}
+                home_results = hybrid_search(
+                    home, query, top_k=fetch_k,
+                    include_archived=include_archived, fence_stats=home_fence,
+                    trusted_only=trusted_only, evaluation_time=evaluation_time,
+                    grounding=home_grounding)
+                fence_stats["fenced_nodes"] = (fence_stats.get("fenced_nodes", [])
+                                                 + home_fence.get("fenced_nodes", []))
+                fence_stats["candidate_count"] = (fence_stats.get("candidate_count", 0)
+                                                   + home_fence.get("candidate_count", 0))
+                if trusted_only:
+                    omissions = fence_stats.setdefault("trusted_omissions", {})
+                    for reason, count in home_fence.get("trusted_omissions", {}).items():
+                        omissions[reason] = omissions.get(reason, 0) + count
+    except ValueError as exc:
+        return f"Error: {exc}"
 
     # The tag filter applies identically to results and fenced candidates
     # so the fence note reflects the same filter set the results use.
@@ -854,9 +892,8 @@ def search(query: str, top_k: int = 10, tags: str = "",
         age = _node_age_str(r)
         caveat = _staleness_caveat(r)
         age_tag = f", {age}" if age else ""
-        source = f", graph={r['_graph_source']}" if home is not None else ""
-        display_id = (_graph_ref(r['_graph_source'], r['id']) if home is not None
-                      else r["id"])
+        display_id = _display_ref(r["_graph_source"], r["id"])
+        source = f", graph={r['_graph_source']}" if display_id != r["id"] else ""
         lines.append(f"{i}. [{r.get('type', 'concept')}] {r.get('title', r['id'])} "
                       f"({score_label}={score_text}, id={display_id}{age_tag}{source}){caveat}")
         content = (r.get("content") or "")[:150]
@@ -2674,7 +2711,8 @@ def task_add(text: str, priority: int = 3, due: str = "",
 
 @_tool()
 def task_list(status: str = "open", scope: str = "",
-              priority: str = "", project_path: str = "", limit: int = 20) -> str:
+              priority: str = "", project_path: str = "", limit: int = 20,
+              graph: str = "auto") -> str:
     """List tasks, optionally filtered.
 
     With an implicitly selected project graph, also includes relevant tasks
@@ -2686,6 +2724,9 @@ def task_list(status: str = "open", scope: str = "",
         priority: Max priority level to show (1-5). Empty for all.
         project_path: Optional explicit project filter.
         limit: Maximum number of matching tasks to return.
+        graph: auto (selected project plus relevant outer tasks), project
+            (selected store only), or global (configured outer store only).
+            This is independent of task scope.
     """
     store, config = _get_store()
     from .tasks import list_tasks, format_task_list
@@ -2697,37 +2738,45 @@ def task_list(status: str = "open", scope: str = "",
             pass
     from .project_store import is_project_store
     local_project = str(config._project_path) if config._project_path else ""
-    default_project = (not project_path and scope != "global" and not config.active_profile
-                       and bool(local_project) and is_project_store(store, local_project))
-    tasks = list_tasks(store, status=status, scope=scope or None,
-                       project_path=project_path or (local_project if default_project else None),
-                       max_priority=max_pri, limit=None if default_project else max(1, min(limit, 500)))
-    if default_project:
-        from pathlib import Path
-        tasks = [task for task in tasks if not (task.get("extra") or {}).get("project_path")
-                 or Path(task["extra"]["project_path"]).resolve() == Path(local_project).resolve()]
-    home = _global_read_store(store, config)
-    if home is not None:
-        from pathlib import Path
-        tasks = [{**task, "_graph_source": "project",
-                  "_graph_ref": _graph_ref("project", task["id"])} for task in tasks]
-        try:
-            home_tasks = list_tasks(home, status=status, scope=scope or None,
-                                    max_priority=max_pri, limit=None)
-        finally:
-            home.close()
-        target = Path(project_path or local_project).resolve()
-        for task in home_tasks:
-            extra = task.get("extra") or {}
-            task_project = extra.get("project_path")
-            task_root = Path(task_project).resolve() if task_project else None
-            if (extra.get("scope") == "global" or task_root
-                    and (task_root == target or task_root in target.parents)):
-                tasks.append({**task, "_graph_source": "global",
-                              "_graph_ref": _graph_ref("global", task["id"])})
-        tasks.sort(key=lambda task: (-task.get("weight", 0),
-                                     (task.get("extra") or {}).get("due") or "9999"))
-    tasks = tasks[:max(1, min(limit, 500))]
+    default_project = (graph == "auto" and not project_path and scope != "global"
+                       and not config.active_profile and bool(local_project)
+                       and is_project_store(store, local_project))
+    max_rows = max(1, min(limit, 500))
+    tasks = []
+    try:
+        with _selected_read_stores(graph) as (selected, home):
+            if selected is not None:
+                tasks = list_tasks(
+                    selected, status=status, scope=scope or None,
+                    project_path=project_path or (local_project if default_project else None),
+                    max_priority=max_pri, limit=None if default_project else max_rows)
+                if default_project:
+                    tasks = [task for task in tasks
+                             if not (task.get("extra") or {}).get("project_path")
+                             or Path(task["extra"]["project_path"]).resolve()
+                             == Path(local_project).resolve()]
+                tasks = [_task_with_graph_ref(task, "project") for task in tasks]
+            if home is not None:
+                home_tasks = list_tasks(
+                    home, status=status, scope=scope or None,
+                    project_path=(project_path or None) if graph == "global" else None,
+                    max_priority=max_pri, limit=None if graph == "auto" else max_rows)
+                if graph == "auto":
+                    target = Path(project_path or local_project).resolve()
+                    for task in home_tasks:
+                        extra = task.get("extra") or {}
+                        task_project = extra.get("project_path")
+                        task_root = Path(task_project).resolve() if task_project else None
+                        if (extra.get("scope") == "global" or task_root
+                                and (task_root == target or task_root in target.parents)):
+                            tasks.append(_task_with_graph_ref(task, "global"))
+                    tasks.sort(key=lambda task: (-task.get("weight", 0),
+                                                 (task.get("extra") or {}).get("due") or "9999"))
+                else:
+                    tasks = [_task_with_graph_ref(task, "global") for task in home_tasks]
+    except ValueError as exc:
+        return f"Error: {exc}"
+    tasks = tasks[:max_rows]
     if not tasks:
         return "No tasks found."
     return format_task_list(tasks)

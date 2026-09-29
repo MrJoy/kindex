@@ -201,6 +201,50 @@ def test_task_list_discovers_relevant_home_tasks_without_routing_mutations(graph
     assert home.get_node(task_id)["extra"]["task_status"] == "done"
 
 
+def test_explicit_search_and_task_graph_scopes(graphs):
+    server, local, home, project = graphs
+    local_id = local.add_node("Project scoped result", content="scopeprobe")
+    home.add_node("Global scoped result", content="scopeprobe")
+    create_task(local, "Project scoped task")
+    create_task(home, "Global scoped task", scope="global")
+    create_task(home, "Foreign backlog item",
+                project_path=str(project.parent / "other"))
+
+    project_search = server.search("scopeprobe", graph="project")
+    global_search = server.search("scopeprobe", graph="global")
+    assert "Project scoped result" in project_search
+    assert "Global scoped result" not in project_search
+    local_ref = server._graph_ref("project", local_id)
+    assert local_ref in project_search
+    assert "Edited Project scoped result" in server.edit(local_ref, append="verified")
+    assert "Global scoped result" in global_search
+    assert "Project scoped result" not in global_search
+    assert "id=global:" in global_search
+
+    project_tasks = server.task_list(graph="project")
+    global_tasks = server.task_list(graph="global")
+    auto_tasks = server.task_list()
+    assert "Project scoped task" in project_tasks
+    assert "Global scoped task" not in project_tasks
+    assert "Global scoped task" in global_tasks
+    assert "Project scoped task" not in global_tasks
+    assert "Foreign backlog item" in global_tasks
+    assert "Foreign backlog item" not in auto_tasks
+    assert "Foreign backlog item" not in server.task_list(
+        graph="global", project_path=str(project))
+    assert "Global scoped task" not in server.task_list(graph="global", scope="contextual")
+
+
+@pytest.mark.parametrize("tool", ["search", "task_list"])
+def test_invalid_read_graph_scope_is_ordinary_error(graphs, tool):
+    server, _, _, _ = graphs
+
+    result = getattr(server, tool)(graph="wrong") if tool == "task_list" else server.search(
+        "anything", graph="wrong")
+
+    assert result == "Error: graph must be 'auto', 'project', or 'global'"
+
+
 def test_qualified_id_routes_edit_and_rejects_cross_graph_link(graphs):
     server, local, home, _ = graphs
     local_id = local.add_node(title="Local evidence", content="project observation")
@@ -288,16 +332,30 @@ def test_global_search_surfaces_its_grounding_warning(graphs, monkeypatch):
 def test_outdated_global_schema_is_typed_and_does_not_mutate_project(graphs):
     server, local, home, _ = graphs
     local_id = local.add_node("Local evidence", content="original")
+    task_id = create_task(local, "Local task")
     home.conn.execute("UPDATE meta SET value='3' WHERE key='schema_version'")
     home.conn.commit()
 
     edit_result = server.edit(local_id, append="unsafe")
-    search_result = server.search("Local evidence")
+    failures = [edit_result, server.search("Local evidence"),
+                server.search("Local evidence", graph="global"),
+                server.task_list(), server.task_list(graph="global")]
 
-    for result in (edit_result, search_result):
+    for result in failures:
         assert result.startswith("Error: memory unavailable (SchemaMigrationPending)")
         assert "kin doctor --fix" in result
-    assert local.get_node(local_id)["content"] == "original"
+    project_search = server.search("Local evidence", graph="project")
+    project_tasks = server.task_list(graph="project")
+    assert server._graph_ref("project", local_id) in project_search
+    assert "Local task" in project_tasks
+    assert "graph:project" in project_tasks
+    task_ref = server._graph_ref("project", task_id)
+    assert task_ref in project_tasks
+    assert server.task_get(task_ref)["task"]["title"] == "Local task"
+    assert "Edited Local evidence" in server.edit(
+        server._graph_ref("project", local_id), append="safe")
+    assert "safe" in local.get_node(local_id)["content"]
+    assert "unsafe" not in local.get_node(local_id)["content"]
     assert home.get_meta("schema_version") == "3"
 
 
@@ -823,8 +881,13 @@ def test_explicit_profile_keeps_search_isolated(graphs):
     server, local, home, _ = graphs
     local.config.active_profile = "work"
     home.add_node(title="Home only", content="distinct home content")
+    create_task(home, "Home-only task", scope="global")
 
     assert "Home only" not in server.search("distinct home content")
+    assert "Home only" not in server.search("distinct home content", graph="project")
+    assert "Home-only task" not in server.task_list()
+    assert "explicit profile" in server.search("distinct home content", graph="global")
+    assert "explicit profile" in server.task_list(graph="global")
 
 
 def test_configured_global_profile_target_keeps_its_stamp(graphs):
@@ -855,7 +918,115 @@ def test_no_home_database_is_not_created(graphs):
     home.close()
     home.db_path.unlink(missing_ok=True)
     assert "No results" in server.search("missing topic")
+    assert "unavailable or missing" in server.search("missing topic", graph="global")
+    assert "unavailable or missing" in server.task_list(graph="global")
+    assert "No tasks" in server.task_list(graph="project")
     assert not home.db_path.exists()
+
+
+def test_ambiguous_outer_profile_is_typed_and_project_scope_still_works(graphs):
+    server, local, home, _ = graphs
+    local.add_node("Local profile-safe result", content="profileambigprobe")
+    local.add_node("Bare collision")
+    home.add_node("Bare collision")
+    local.config.profiles["one"] = ProfileEntry(data_dir=str(home.config.data_path))
+    local.config.profiles["two"] = ProfileEntry(data_dir=str(home.config.data_path))
+
+    for result in (server.search("profileambigprobe"), server.task_list(),
+                   server.search("profileambigprobe", graph="global"),
+                   server.task_list(graph="global")):
+        assert result.startswith("Error: memory unavailable (ValueError)")
+        assert "matches multiple profiles" in result
+    assert "Local profile-safe result" in server.search(
+        "profileambigprobe", graph="project")
+    assert server.edit("Bare collision", append="unsafe").startswith(
+        "Error: memory unavailable (ValueError)")
+    assert local.get_node_by_title("Bare collision")["content"] == ""
+    assert home.get_meta("schema_version") is not None
+
+
+def test_secondary_constructor_path_failure_preserves_cause_and_cleans_up(
+    graphs, monkeypatch,
+):
+    import kindex.store as store_module
+
+    server, local, _, _ = graphs
+    local.add_node("Local constructor-safe result", content="constructorprobe")
+    closed = []
+
+    class BrokenSecondary:
+        @property
+        def db_path(self):
+            raise OSError("secondary path failed")
+
+        def close(self):
+            closed.append(True)
+            raise RuntimeError("secondary close failed")
+
+    monkeypatch.setattr(store_module, "Store", lambda *args, **kwargs: BrokenSecondary())
+    result = server.search("constructorprobe")
+
+    assert result.startswith("Error: memory unavailable (OSError)")
+    assert closed == [True]
+    assert "Local constructor-safe result" in server.search(
+        "constructorprobe", graph="project")
+
+
+def test_secondary_store_constructor_failure_is_typed(graphs, monkeypatch):
+    import kindex.store as store_module
+
+    server, local, _, _ = graphs
+    local.add_node("Local constructor result", content="constructorfailprobe")
+
+    def fail_constructor(*args, **kwargs):
+        raise RuntimeError("secondary constructor failed")
+
+    monkeypatch.setattr(store_module, "Store", fail_constructor)
+    assert server.search("constructorfailprobe").startswith(
+        "Error: memory unavailable (RuntimeError)")
+    assert "Local constructor result" in server.search(
+        "constructorfailprobe", graph="project")
+
+
+def test_secondary_config_constructor_failure_is_typed(graphs, monkeypatch):
+    import kindex.config as config_module
+
+    server, local, _, _ = graphs
+    local.add_node("Local config result", content="configfailprobe")
+
+    def fail_constructor(*args, **kwargs):
+        raise RuntimeError("secondary config failed")
+
+    monkeypatch.setattr(config_module, "Config", fail_constructor)
+    assert server.task_list().startswith("Error: memory unavailable (RuntimeError)")
+    assert "Local config result" in server.search(
+        "configfailprobe", graph="project")
+
+
+def test_secondary_teardown_does_not_mask_query_failure(graphs, monkeypatch):
+    import kindex.retrieve as retrieve
+
+    server, _, _, _ = graphs
+    closed = []
+
+    class BrokenSecondary:
+        def close(self):
+            closed.append(True)
+            raise RuntimeError("close failed")
+
+    outer = BrokenSecondary()
+    monkeypatch.setattr(server, "_global_read_store", lambda *args: outer)
+
+    def failing_search(store, *args, **kwargs):
+        if store is outer:
+            raise sqlite3.OperationalError("query failed")
+        return []
+
+    monkeypatch.setattr(retrieve, "hybrid_search", failing_search)
+    result = server.search("anything")
+
+    assert result == "Error: memory unavailable (OperationalError)"
+    assert closed == [True]
 
 
 def test_load_config_uses_nondefault_global_data_dir(tmp_path, monkeypatch):
