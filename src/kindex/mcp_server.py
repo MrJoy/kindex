@@ -459,13 +459,18 @@ def _write_store_for_graph(graph: str):
     raise ValueError("graph must be 'project' or 'global'")
 
 
-def _derived_write_store(graph: str, source_refs: str):
-    refs = [item.strip() for item in source_refs.split(",") if item.strip()]
+def _derived_write_store(graph: str, source_refs: str, link_refs: str = ""):
+    refs = [item.strip() for item in source_refs.split(",")] if source_refs else []
+    if any(not ref for ref in refs):
+        raise ValueError("Source references must be graph-qualified result IDs")
     sources = [_split_graph_ref(item) for item in refs]
-    primary, config = _get_store()
     for ref, source in zip(refs, sources):
         if source is None:
-            continue
+            raise ValueError(f"Source reference {ref} must be a graph-qualified result ID")
+    links = [item.strip() for item in link_refs.split(",") if item.strip()]
+    link_sources = [_split_graph_ref(item) for item in links]
+    primary, config = _get_store()
+    for ref, source in zip(refs, sources):
         role, node_id = source
         evidence = primary if role == "project" else _global_read_store(primary, config)
         if evidence is None:
@@ -476,13 +481,55 @@ def _derived_write_store(graph: str, source_refs: str):
         finally:
             if evidence is not primary:
                 evidence.close()
-    if any(source and source[0] == "global" for source in sources):
+    if any(source and source[0] == "global" for source in (*sources, *link_sources)):
         if graph == "project":
             raise ValueError("Global source requires graph='global' or automatic routing")
         graph = "global"
     graph = graph or "project"
     store, config = _write_store_for_graph(graph)
     return store, config, graph
+
+
+def _validated_link_targets(store, graph: str, refs: list[str]) -> list[str]:
+    """Resolve all requested links before writing; bare refs must be unambiguous."""
+    from .store import AmbiguousTitleError
+
+    primary, primary_config = _get_store()
+    other = None
+    checked_other = False
+    targets = []
+    try:
+        for ref in refs:
+            if not isinstance(ref, str) or not ref.strip():
+                raise ValueError("Link target must be a non-empty node ID or title")
+            qualified = _split_graph_ref(ref)
+            if qualified and qualified[0] != graph:
+                raise ValueError("cross-graph links are not supported")
+            raw_ref = qualified[1] if qualified else ref
+            try:
+                target = store.resolve_node_for_write(raw_ref)
+            except AmbiguousTitleError as exc:
+                raise ValueError(f"title_collision: {exc}") from exc
+            if target is None:
+                raise ValueError(f"Link target {ref} is unavailable")
+            if not qualified:
+                if not checked_other:
+                    other = (primary if graph == "global" else
+                             _global_read_store(primary, primary_config))
+                    checked_other = True
+                if other is not None:
+                    try:
+                        other_match = other.resolve_node_for_write(ref)
+                    except AmbiguousTitleError:
+                        other_match = True
+                    if other_match:
+                        raise ValueError(
+                            f"Node {ref} exists in both graphs; use a qualified search result ID")
+            targets.append(target["id"])
+    finally:
+        if other is not None and other is not primary:
+            other.close()
+    return targets
 
 
 def _get_config():
@@ -2627,24 +2674,16 @@ def task_add(text: str, priority: int = 3, due: str = "",
     """
     try:
         store, _, graph = _derived_write_store(
-            graph, ",".join(part for part in (source_refs, link_to) if part))
+            graph, source_refs, link_to)
+        refs = [ref.strip() for ref in link_to.split(",") if ref.strip()]
+        links = _validated_link_targets(store, graph, refs)
     except ValueError as exc:
         return f"Could not create task: {exc}"
     from .tasks import create_task
-    links = [s.strip() for s in link_to.split(",") if s.strip()] if link_to else None
-    try:
-        qualified_links = [_split_graph_ref(link) for link in links] if links else []
-    except ValueError as exc:
-        return f"Could not create task: {exc}"
-    if any(source and source[0] != graph for source in qualified_links):
-        return "Could not create task: cross-graph links are not supported"
-    if links:
-        links = [source[1] if source else link
-                 for link, source in zip(links, qualified_links)]
     try:
         task_id = create_task(
             store, text, priority=priority, due=due or None, scope=scope,
-            effort=effort or None, link_to=links,
+            effort=effort or None, link_to=links or None,
             project_path=project_path or None, session_id=session_id or None,
         )
     except ValueError as exc:
@@ -2853,8 +2892,11 @@ def task_update(id: str, title: str | None = None, content: str | None = None,
         return {"ok": False, "error": {"code": "cross_graph_dependency",
                                       "message": "Task dependencies must be in one graph"}}
     if dependencies:
-        dependencies = [source[1] if source else dep
-                        for dep, source in zip(dependencies, qualified_deps)]
+        try:
+            dependencies = _validated_link_targets(store, graph, dependencies)
+        except ValueError as exc:
+            return {"ok": False, "error": {"code": "invalid_argument",
+                                          "message": safe_error(exc)}}
     fields = {key: value for key, value in {
         "title": title, "content": content, "task_status": status,
         "priority": priority, "due": due, "owner": owner,
@@ -2949,10 +2991,15 @@ def coord_start(name: str, task_id: str = "", agent: str = "",
     store, _ = _get_store()
     from .coordination import create_conversation
     try:
+        related_task = None
+        if task_id:
+            related_task = _validated_link_targets(store, "project", [task_id])[0]
+            if store.peek_node(related_task)["type"] != "task":
+                raise ValueError(f"Related node {task_id} is not a task")
         conv_id = create_conversation(
             store,
             name,
-            task_id=task_id or None,
+            task_id=related_task,
             ttl_minutes=ttl_minutes,
             created_by=_default_agent(agent),
         )
@@ -3238,47 +3285,10 @@ def watch_add(text: str, owner: str = "", expires: str = "",
         source_refs: Comma-separated graph-qualified evidence IDs. A global
             source routes this watch to the global graph.
     """
-    from .store import AmbiguousTitleError
-
     refs = [ref.strip() for ref in link_to.split(",") if ref.strip()]
     try:
-        store, _, graph = _derived_write_store(
-            graph, ",".join(part for part in (source_refs, link_to) if part))
-
-        # Resolve every target before creating the watch. A bare name or ID
-        # present in both graphs cannot identify which graph the caller meant.
-        primary, primary_config = _get_store()
-        other = None
-        checked_other = False
-        try:
-            targets = []
-            for ref in refs:
-                qualified = _split_graph_ref(ref)
-                if qualified and qualified[0] != graph:
-                    raise ValueError("cross-graph links are not supported")
-                raw_ref = qualified[1] if qualified else ref
-                target = store.resolve_node_for_write(raw_ref)
-                if target is None:
-                    raise ValueError(f"Link target {ref} is unavailable")
-                if not qualified:
-                    if not checked_other:
-                        other = (primary if graph == "global" else
-                                 _global_read_store(primary, primary_config))
-                        checked_other = True
-                    if other is not None:
-                        try:
-                            other_match = other.resolve_node_for_write(ref)
-                        except AmbiguousTitleError:
-                            other_match = True
-                        if other_match:
-                            raise ValueError(
-                                f"Node {ref} exists in both graphs; use a qualified search result ID")
-                targets.append(target["id"])
-        finally:
-            if other is not None and other is not primary:
-                other.close()
-    except AmbiguousTitleError as exc:
-        return f"Error: title_collision: {exc}"
+        store, _, graph = _derived_write_store(graph, source_refs, link_to)
+        targets = _validated_link_targets(store, graph, refs)
     except ValueError as exc:
         return f"Error: {exc}"
 
@@ -3599,15 +3609,19 @@ def mode_create(name: str, primer: str, boundary: str, permissions: str,
     """
     store, _ = _get_store()
     from .modes import create_mode
-    links = [s.strip() for s in link_to.split(",") if s.strip()] if link_to else None
-    mode_id = create_mode(
-        store, name,
-        primer=primer,
-        boundary=boundary,
-        permissions=permissions,
-        description=description,
-        link_to=links,
-    )
+    refs = [ref.strip() for ref in link_to.split(",") if ref.strip()]
+    try:
+        links = _validated_link_targets(store, "project", refs)
+        mode_id = create_mode(
+            store, name,
+            primer=primer,
+            boundary=boundary,
+            permissions=permissions,
+            description=description,
+            link_to=links or None,
+        )
+    except ValueError as exc:
+        return f"Could not create mode: {exc}"
     return f"Created mode: {name} ({mode_id})"
 
 

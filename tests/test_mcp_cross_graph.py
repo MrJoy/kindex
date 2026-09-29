@@ -338,6 +338,28 @@ def test_project_task_response_dependencies_round_trip_with_id_collision(graphs)
     assert server.task_get(dependency_ref)["task"]["title"] == "Project dependency"
 
 
+def test_task_update_rejects_bare_colliding_dependency_without_mutation(graphs):
+    server, local, home, _ = graphs
+    dependency_id = create_task(local, "Project dependency")
+    task_id = create_task(local, "Project dependent")
+    home.add_node("Global dependency collision", node_id=dependency_id)
+    task_ref = server._graph_ref("project", task_id)
+    dependency_ref = server._graph_ref("project", dependency_id)
+    before = server.task_get(task_ref)["task"]
+
+    rejected = server.task_update(task_ref, dependencies=[dependency_id])
+
+    assert rejected["ok"] is False
+    assert "exists in both graphs" in rejected["error"]["message"]
+    unchanged = server.task_get(task_ref)["task"]
+    assert unchanged["version"] == before["version"]
+    assert unchanged["dependencies"] == before["dependencies"]
+
+    accepted = server.task_update(task_ref, dependencies=[dependency_ref])
+    assert accepted["ok"]
+    assert accepted["task"]["dependencies"] == [dependency_ref]
+
+
 def test_node_detail_and_resource_preserve_global_connection_refs(graphs):
     server, local, home, _ = graphs
     node_id = home.add_node("Global detail", content="User content has raw id 123")
@@ -532,6 +554,189 @@ def test_watch_add_explicit_profile_cannot_cross_to_global(graphs):
     assert "global graph is unavailable" in result.lower()
     assert local.get_node_by_title("Profile-isolated watch") is None
     assert home.get_node_by_title("Profile-isolated watch") is None
+
+
+def test_global_task_add_links_only_to_qualified_global_target(graphs):
+    server, local, home, _ = graphs
+    shared_id = "abc123def456"
+    local.add_node("Project collision", node_id=shared_id)
+    home.add_node("Global target", node_id=shared_id)
+
+    result = server.task_add("Global linked task",
+                             link_to=server._graph_ref("global", shared_id))
+
+    assert "Created task: global:" in result
+    task = home.get_node_by_title("Global linked task")
+    assert task is not None
+    assert any(edge["to_id"] == shared_id for edge in home.edges_from(task["id"]))
+    assert local.get_node_by_title("Global linked task") is None
+
+
+def test_task_add_accepts_unique_bare_local_alias(graphs):
+    server, local, home, _ = graphs
+    target_id = local.add_node("Canonical local target", aka=["Local alias"])
+
+    result = server.task_add("Bare alias linked task", link_to="Local alias")
+
+    assert "Created task" in result
+    task = local.get_node_by_title("Bare alias linked task")
+    assert any(edge["to_id"] == target_id for edge in local.edges_from(task["id"]))
+    assert home.get_node_by_title("Bare alias linked task") is None
+
+
+@pytest.mark.parametrize("bad_ref, expected", [
+    ("missing", "unavailable"),
+    ("stale", "Stale graph reference"),
+    ("mixed", "cross-graph links"),
+    ("duplicate_title", "title_collision"),
+    ("alias_collision", "exists in both graphs"),
+])
+def test_task_add_rejects_all_invalid_links_before_creation(graphs, bad_ref, expected):
+    server, local, home, _ = graphs
+    project_id = local.add_node("Project link")
+    global_id = home.add_node("Global link")
+    if bad_ref == "missing":
+        refs = f"{server._graph_ref('project', project_id)},missing target"
+    elif bad_ref == "stale":
+        refs = f"{server._graph_ref('project', project_id)},project:oldscope:{project_id}"
+    elif bad_ref == "mixed":
+        refs = (f"{server._graph_ref('project', project_id)},"
+                f"{server._graph_ref('global', global_id)}")
+    elif bad_ref == "duplicate_title":
+        local.add_node("Duplicate title")
+        local.add_node("Duplicate title")
+        refs = f"{server._graph_ref('project', project_id)},Duplicate title"
+    else:
+        local.add_node("Local alias owner", aka=["Shared alias"])
+        home.add_node("Global alias owner", aka=["SHARED ALIAS"])
+        refs = f"{server._graph_ref('project', project_id)},Shared alias"
+
+    result = server.task_add("Rejected linked task", link_to=refs)
+
+    assert expected in result
+    assert local.get_node_by_title("Rejected linked task") is None
+    assert home.get_node_by_title("Rejected linked task") is None
+
+
+@pytest.mark.parametrize("tool", ["add", "task_add", "watch_add", "learn"])
+@pytest.mark.parametrize("bad_source, expected", [
+    ("bare", "must be a graph-qualified result ID"),
+    ("empty", "must be graph-qualified result IDs"),
+    ("stale", "Stale graph reference"),
+    ("missing", "unavailable"),
+])
+def test_invalid_source_refs_are_rejected_before_creation(
+    graphs, tool, bad_source, expected,
+):
+    server, local, home, _ = graphs
+    source_id = local.add_node("Bare provenance")
+    source_ref = {
+        "bare": "Bare provenance",
+        "empty": ",",
+        "stale": f"project:oldscope:{source_id}",
+        "missing": server._graph_ref("project", "000000000000"),
+    }[bad_source]
+
+    result = getattr(server, tool)("Rejected provenance", source_refs=source_ref)
+
+    assert expected in result
+    assert local.get_node_by_title("Rejected provenance") is None
+    assert home.get_node_by_title("Rejected provenance") is None
+
+
+def test_selected_store_mode_and_coord_accept_qualified_project_refs(graphs):
+    server, local, home, _ = graphs
+    target_id = local.add_node("Mode context")
+    task_id = create_task(local, "Coordination task")
+
+    mode = server.mode_create("project-mode", "primer", "boundary", "permissions",
+                              link_to=server._graph_ref("project", target_id))
+    coord = server.coord_start("Project room", task_id=server._graph_ref("project", task_id))
+
+    assert "Created mode" in mode
+    mode_node = local.get_node_by_title("mode:project-mode")
+    assert any(edge["to_id"] == target_id for edge in local.edges_from(mode_node["id"]))
+    assert "Started coordination conversation" in coord
+    from kindex.coordination import get_conversation
+    room = get_conversation(local, "project-room")
+    assert room["extra"]["task_id"] == task_id
+    assert any(edge["to_id"] == task_id for edge in local.edges_from(room["id"]))
+    assert home.get_node_by_title("mode:project-mode") is None
+
+
+def test_coord_start_rejects_non_task_before_creating_conversation(graphs):
+    server, local, _, _ = graphs
+    concept_id = local.add_node("Not a task")
+
+    result = server.coord_start(
+        "Invalid task room", task_id=server._graph_ref("project", concept_id))
+
+    assert "is not a task" in result
+    from kindex.coordination import get_conversation
+    assert get_conversation(local, "invalid-task-room") is None
+
+
+@pytest.mark.parametrize("kind, bad_ref, expected", [
+    ("mode", "global", "cross-graph links"),
+    ("mode", "stale", "Stale graph reference"),
+    ("mode", "missing", "unavailable"),
+    ("mode", "ambiguous", "title_collision"),
+    ("coord", "global", "cross-graph links"),
+    ("coord", "stale", "Stale graph reference"),
+    ("coord", "missing", "unavailable"),
+    ("coord", "ambiguous", "title_collision"),
+])
+def test_selected_store_facilities_reject_refs_before_creation(
+    graphs, kind, bad_ref, expected,
+):
+    server, local, home, _ = graphs
+    local_id = (create_task(local, "Valid project task") if kind == "coord"
+                else local.add_node("Valid project context"))
+    global_id = home.add_node("Global context")
+    if bad_ref == "global":
+        ref = server._graph_ref("global", global_id)
+    elif bad_ref == "stale":
+        ref = f"project:oldscope:{local_id}"
+    elif bad_ref == "missing":
+        missing = server._graph_ref("project", "000000000000")
+        ref = (f"{server._graph_ref('project', local_id)},{missing}"
+               if kind == "mode" else missing)
+    else:
+        if kind == "coord":
+            create_task(local, "Duplicate task")
+            create_task(local, "Duplicate task")
+            ref = "Duplicate task"
+        else:
+            local.add_node("Duplicate context")
+            local.add_node("Duplicate context")
+            ref = "Duplicate context"
+    if kind == "mode":
+        result = server.mode_create("rejected-mode", "primer", "boundary",
+                                    "permissions", link_to=ref)
+        assert local.get_node_by_title("mode:rejected-mode") is None
+    else:
+        result = server.coord_start("Rejected room", task_id=ref)
+        from kindex.coordination import get_conversation
+        assert get_conversation(local, "rejected-room") is None
+    assert expected in result
+
+
+def test_qualified_project_links_do_not_open_secondary_for_writes(graphs, monkeypatch):
+    server, local, _, _ = graphs
+    node_id = local.add_node("Local context")
+    task_id = create_task(local, "Local task")
+
+    def forbidden_secondary(*args, **kwargs):
+        raise AssertionError("qualified project reference opened secondary")
+
+    monkeypatch.setattr(server, "_global_read_store", forbidden_secondary)
+    assert "Created task" in server.task_add(
+        "Qualified local task", link_to=server._graph_ref("project", node_id))
+    assert "Created mode" in server.mode_create(
+        "qualified-mode", "primer", "boundary", "permissions",
+        link_to=server._graph_ref("project", node_id))
+    assert "Started coordination" in server.coord_start(
+        "Qualified room", task_id=server._graph_ref("project", task_id))
 
 
 def test_explicit_profile_keeps_search_isolated(graphs):
